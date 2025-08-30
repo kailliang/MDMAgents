@@ -31,6 +31,13 @@ class LangGraphAgent:
     
     def chat(self, message):
         """Placeholder for agent chat - will be implemented in next stages"""
+        # Simulate token usage for realistic testing
+        input_tokens = len(message.split()) * 2  # Rough approximation
+        output_tokens = 10  # Mock output tokens
+        
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        
         return f"[LangGraph] {self.role} response to: {message}"
     
     def get_token_usage(self):
@@ -53,6 +60,7 @@ class MDMStateDict(TypedDict):
     messages: Annotated[List, add_messages]
     question: str
     difficulty: Optional[Literal["basic", "intermediate", "advanced"]]
+    confidence: Optional[float]
     agents: List[Dict]
     token_usage: Dict[str, int]
     processing_stage: str
@@ -75,7 +83,8 @@ class MDMState:
             "agents": [],
             "token_usage": {"input": 0, "output": 0},
             "processing_stage": "start",
-            "final_decision": None
+            "final_decision": None,
+            "confidence": None
         }
         
         # Merge with provided kwargs
@@ -225,50 +234,48 @@ class DifficultyAssessorNode:
 
 def create_mdm_graph(model_info: str) -> StateGraph:
     """
-    Create the main MDM StateGraph with basic structure.
-    This is a minimal implementation to pass tests.
+    Create the main MDM StateGraph with integrated difficulty assessment.
+    Uses real difficulty assessment and routing system.
     """
+    # Import the difficulty assessment components
+    from langgraph_difficulty import DifficultyAssessorNode, difficulty_router
     
     def start_node(state: MDMStateDict) -> MDMStateDict:
-        """Entry point node"""
+        """Entry point node - initializes processing"""
         return {"processing_stage": "started"}
     
-    def router_node(state: MDMStateDict) -> Command:
-        """Route based on difficulty"""
-        difficulty = state.get("difficulty", "intermediate")
-        
-        if difficulty == "basic":
-            return Command(goto="basic_processing")
-        elif difficulty == "intermediate":
-            return Command(goto="intermediate_processing")
-        else:
-            return Command(goto="advanced_processing")
+    def difficulty_assessment_node(state: MDMStateDict) -> Command:
+        """Real difficulty assessment using LLM"""
+        assessor = DifficultyAssessorNode(model_info=model_info)
+        return assessor.assess_difficulty(state)
     
     def basic_processing_node(state: MDMStateDict) -> MDMStateDict:
-        """Basic processing placeholder"""
-        return {"processing_stage": "basic_complete"}
+        """Basic processing placeholder - will be implemented in Stage 3"""
+        return {"processing_stage": "basic_complete", "final_decision": {"placeholder": "basic_result"}}
     
     def intermediate_processing_node(state: MDMStateDict) -> MDMStateDict:
-        """Intermediate processing placeholder"""
-        return {"processing_stage": "intermediate_complete"}
+        """Intermediate processing placeholder - will be implemented in Stage 4"""
+        return {"processing_stage": "intermediate_complete", "final_decision": {"placeholder": "intermediate_result"}}
     
     def advanced_processing_node(state: MDMStateDict) -> MDMStateDict:
-        """Advanced processing placeholder"""  
-        return {"processing_stage": "advanced_complete"}
+        """Advanced processing placeholder - will be implemented in Stage 5"""  
+        return {"processing_stage": "advanced_complete", "final_decision": {"placeholder": "advanced_result"}}
     
     # Create StateGraph with the TypedDict
     graph = StateGraph(MDMStateDict)
     
     # Add nodes
     graph.add_node("start", start_node)
-    graph.add_node("router", router_node)
+    graph.add_node("assess_difficulty", difficulty_assessment_node)
     graph.add_node("basic_processing", basic_processing_node)
     graph.add_node("intermediate_processing", intermediate_processing_node)
     graph.add_node("advanced_processing", advanced_processing_node)
     
-    # Add edges
+    # Add edges - updated flow with difficulty assessment
     graph.add_edge(START, "start")
-    graph.add_edge("start", "router")
+    graph.add_edge("start", "assess_difficulty")
+    # Difficulty assessment node uses Command objects for dynamic routing
+    # No explicit edges needed - Command handles routing
     graph.add_edge("basic_processing", END)
     graph.add_edge("intermediate_processing", END)
     graph.add_edge("advanced_processing", END)
