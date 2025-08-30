@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """
 LangGraph-based MDMAgents core infrastructure.
-Minimal implementation to pass tests, following TDD approach.
+Real LLM implementation for production use.
 """
 
 from typing import Dict, List, Optional, Literal, Annotated, Union
 from typing_extensions import TypedDict
 import os
+import sys
+import traceback
+import logging
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
 import json
 
-# Create Agent interface for LangGraph compatibility
-# This will be used until we fully replace the utils.Agent class
+# Import required APIs
+import google.generativeai as genai
+from openai import OpenAI
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
 class LangGraphAgent:
     """
-    LangGraph-compatible agent interface.
-    Will eventually replace utils.Agent with LangGraph integration.
+    Production LangGraph agent with real LLM integration.
+    Implements same API patterns as original Agent class but for LangGraph.
     """
     def __init__(self, instruction, role, model_info):
         self.instruction = instruction
@@ -26,19 +35,120 @@ class LangGraphAgent:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         
-        # Store for later implementation
-        self._initialized = False
+        logger.info(f"Initializing LangGraphAgent: {role} with model {model_info}")
+        
+        # Initialize model based on type
+        if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17']:
+            self._init_gemini()
+        elif self.model_info in ['gpt-4o-mini', 'gpt-4.1-mini']:
+            self._init_openai()
+        else:
+            raise ValueError(f"Unsupported model: {self.model_info}")
+    
+    def _init_gemini(self):
+        """Initialize Gemini model"""
+        if 'genai_api_key' in os.environ:
+            logger.debug(f"Configuring Gemini API for {self.role}")
+            genai.configure(api_key=os.environ['genai_api_key'])
+            self.model = genai.GenerativeModel(self.model_info)
+            self._chat = self.model.start_chat(history=[])
+        else:
+            raise ValueError("Gemini API key not configured. Set 'genai_api_key' in .env file.")
+    
+    def _init_openai(self):
+        """Initialize OpenAI model"""
+        api_key = os.environ.get('openai_api_key')
+        if not api_key:
+            raise ValueError("OpenAI API key not found. Set 'openai_api_key' environment variable.")
+        
+        logger.debug(f"Configuring OpenAI API for {self.role}")
+        self.client = OpenAI(api_key=api_key)
+        
+        # Initialize messages with system instruction
+        self.messages = [
+            {"role": "system", "content": str(self.instruction)},
+        ]
     
     def chat(self, message):
-        """Placeholder for agent chat - will be implemented in next stages"""
-        # Simulate token usage for realistic testing
-        input_tokens = len(message.split()) * 2  # Rough approximation
-        output_tokens = 10  # Mock output tokens
+        """Make real LLM API call"""
+        logger.info(f"LLM call initiated - Agent: {self.role}, Model: {self.model_info}")
+        logger.debug(f"Input message length: {len(str(message))} characters")
         
-        self.total_input_tokens += input_tokens
-        self.total_output_tokens += output_tokens
+        try:
+            if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17']:
+                return self._call_gemini(message)
+            elif self.model_info in ['gpt-4o-mini', 'gpt-4.1-mini']:
+                return self._call_openai(message)
+            else:
+                raise ValueError(f"Unsupported model: {self.model_info}")
+                
+        except Exception as e:
+            logger.error(f"LLM call failed - Agent: {self.role}, Error: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            # Return error response that can be handled gracefully
+            return f"Error: LLM call failed for {self.role}: {str(e)}"
+    
+    def _call_gemini(self, message):
+        """Call Gemini API"""
+        logger.debug(f"Making Gemini API call for {self.role}")
         
-        return f"[LangGraph] {self.role} response to: {message}"
+        try:
+            # Configure generation with temperature=0.0 for deterministic responses
+            generation_config = genai.GenerationConfig(temperature=0.0)
+            response = self._chat.send_message(str(message), generation_config=generation_config)
+            
+            # Track token usage
+            if hasattr(response, 'usage_metadata'):
+                if hasattr(response.usage_metadata, 'prompt_token_count'):
+                    input_tokens = response.usage_metadata.prompt_token_count
+                    self.total_input_tokens += input_tokens
+                    logger.debug(f"Input tokens: {input_tokens}")
+                if hasattr(response.usage_metadata, 'candidates_token_count'):
+                    output_tokens = response.usage_metadata.candidates_token_count
+                    self.total_output_tokens += output_tokens
+                    logger.debug(f"Output tokens: {output_tokens}")
+            
+            response_text = response.text
+            logger.info(f"LLM call successful - Agent: {self.role}, Response length: {len(response_text)}")
+            logger.debug(f"Response preview: {response_text[:100]}...")
+            
+            return response_text
+            
+        except Exception as e:
+            logger.error(f"Gemini API call failed for {self.role}: {e}")
+            raise
+    
+    def _call_openai(self, message):
+        """Call OpenAI API"""
+        logger.debug(f"Making OpenAI API call for {self.role}")
+        
+        try:
+            # Add user message
+            api_messages = self.messages + [{"role": "user", "content": str(message)}]
+            
+            response = self.client.chat.completions.create(
+                model=self.model_info,
+                messages=api_messages,
+                temperature=0.0
+            )
+            
+            # Track token usage
+            if hasattr(response, 'usage'):
+                input_tokens = response.usage.prompt_tokens
+                output_tokens = response.usage.completion_tokens
+                self.total_input_tokens += input_tokens
+                self.total_output_tokens += output_tokens
+                logger.debug(f"Input tokens: {input_tokens}, Output tokens: {output_tokens}")
+            
+            response_text = response.choices[0].message.content
+            logger.info(f"LLM call successful - Agent: {self.role}, Response length: {len(response_text)}")
+            logger.debug(f"Response preview: {response_text[:100]}...")
+            
+            return response_text
+            
+        except Exception as e:
+            logger.error(f"OpenAI API call failed for {self.role}: {e}")
+            raise
     
     def get_token_usage(self):
         """Get token usage statistics"""
@@ -234,11 +344,15 @@ class DifficultyAssessorNode:
 
 def create_mdm_graph(model_info: str) -> StateGraph:
     """
-    Create the main MDM StateGraph with integrated difficulty assessment.
-    Uses real difficulty assessment and routing system.
+    Create the main MDM StateGraph with integrated difficulty assessment and all processing modes.
+    Uses real difficulty assessment, routing system, 3-expert + arbitrator basic processing,
+    multi-round debate intermediate processing, and MDT advanced processing.
     """
-    # Import the difficulty assessment components
+    # Import the difficulty assessment and processing components
     from langgraph_difficulty import DifficultyAssessorNode, difficulty_router
+    from langgraph_basic import create_basic_processing_subgraph
+    from langgraph_intermediate import create_intermediate_processing_subgraph
+    from langgraph_advanced import create_advanced_processing_subgraph
     
     def start_node(state: MDMStateDict) -> MDMStateDict:
         """Entry point node - initializes processing"""
@@ -249,17 +363,10 @@ def create_mdm_graph(model_info: str) -> StateGraph:
         assessor = DifficultyAssessorNode(model_info=model_info)
         return assessor.assess_difficulty(state)
     
-    def basic_processing_node(state: MDMStateDict) -> MDMStateDict:
-        """Basic processing placeholder - will be implemented in Stage 3"""
-        return {"processing_stage": "basic_complete", "final_decision": {"placeholder": "basic_result"}}
-    
-    def intermediate_processing_node(state: MDMStateDict) -> MDMStateDict:
-        """Intermediate processing placeholder - will be implemented in Stage 4"""
-        return {"processing_stage": "intermediate_complete", "final_decision": {"placeholder": "intermediate_result"}}
-    
-    def advanced_processing_node(state: MDMStateDict) -> MDMStateDict:
-        """Advanced processing placeholder - will be implemented in Stage 5"""  
-        return {"processing_stage": "advanced_complete", "final_decision": {"placeholder": "advanced_result"}}
+    # Create and compile all processing subgraphs
+    basic_subgraph = create_basic_processing_subgraph(model_info=model_info).compile()
+    intermediate_subgraph = create_intermediate_processing_subgraph(model_info=model_info).compile()
+    advanced_subgraph = create_advanced_processing_subgraph(model_info=model_info).compile()
     
     # Create StateGraph with the TypedDict
     graph = StateGraph(MDMStateDict)
@@ -267,9 +374,9 @@ def create_mdm_graph(model_info: str) -> StateGraph:
     # Add nodes
     graph.add_node("start", start_node)
     graph.add_node("assess_difficulty", difficulty_assessment_node)
-    graph.add_node("basic_processing", basic_processing_node)
-    graph.add_node("intermediate_processing", intermediate_processing_node)
-    graph.add_node("advanced_processing", advanced_processing_node)
+    graph.add_node("basic_processing", basic_subgraph)  # Use compiled basic subgraph
+    graph.add_node("intermediate_processing", intermediate_subgraph)  # Use compiled intermediate subgraph
+    graph.add_node("advanced_processing", advanced_subgraph)  # Use compiled advanced subgraph
     
     # Add edges - updated flow with difficulty assessment
     graph.add_edge(START, "start")

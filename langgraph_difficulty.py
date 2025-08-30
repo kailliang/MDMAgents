@@ -6,9 +6,13 @@ Implements enhanced difficulty classification with LangGraph integration.
 
 import json
 import re
+import logging
 from typing import Dict, Any, Literal
 from langgraph.types import Command
 from langgraph_mdm import LangGraphAgent, MDMStateDict
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class DifficultyAssessorNode:
@@ -69,26 +73,31 @@ Provide your assessment in the following JSON format:
     
     def _call_llm(self, question: str) -> tuple[str, Dict[str, int]]:
         """Call LLM with difficulty assessment prompt"""
+        logger.info(f"Starting difficulty assessment for question: {question[:50]}...")
+        
         agent = self._get_agent()
         
         # Format the prompt with the question
         formatted_prompt = self.difficulty_prompt_template.format(question=question)
+        logger.debug(f"Formatted prompt for difficulty assessment: {formatted_prompt[:100]}...")
         
-        # For now, using mock response to match existing Agent interface
-        # In a real implementation, this would call agent.temp_responses()
+        # Get current token usage before call
+        usage_before = agent.get_token_usage()
+        
+        # Make real LLM call
         response = agent.chat(formatted_prompt)
         
-        # Mock token usage that matches Agent interface
-        usage = agent.get_token_usage()
+        # Calculate token usage for this call
+        usage_after = agent.get_token_usage()
         token_usage = {
-            "input_tokens": usage["input_tokens"], 
-            "output_tokens": usage["output_tokens"]
+            "input_tokens": usage_after["input_tokens"] - usage_before["input_tokens"], 
+            "output_tokens": usage_after["output_tokens"] - usage_before["output_tokens"]
         }
         
-        # Generate realistic JSON response based on question characteristics
-        response_json = self._generate_mock_response(question)
+        logger.info(f"Difficulty assessment completed - Tokens used: {token_usage}")
+        logger.debug(f"Raw LLM response: {response}")
         
-        return response_json, token_usage
+        return response, token_usage
     
     def _generate_mock_response(self, question: str) -> str:
         """Generate realistic difficulty assessment for testing"""

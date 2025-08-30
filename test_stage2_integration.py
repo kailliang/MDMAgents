@@ -12,7 +12,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def test_end_to_end_basic_processing():
-    """Test complete flow for basic difficulty questions"""
+    """Test complete flow for basic difficulty questions with real basic processing"""
     from langgraph_mdm import create_mdm_graph, MDMState
     
     # Create graph
@@ -32,15 +32,18 @@ def test_end_to_end_basic_processing():
     # Run the graph
     result = compiled_graph.invoke(initial_state)
     
-    # Verify results
+    # Verify results - now using real basic processing
     assert result["difficulty"] == "basic"
     assert result["processing_stage"] == "basic_complete"
-    assert result["final_decision"]["placeholder"] == "basic_result"
+    assert "final_decision" in result
+    # Should have real arbitrator decision with analysis and final_answer
+    assert "analysis" in result["final_decision"]
+    assert "final_answer" in result["final_decision"]
     assert result["token_usage"]["input"] > 0  # Tokens were used
     assert result["token_usage"]["output"] > 0
 
 def test_end_to_end_intermediate_processing():
-    """Test complete flow for intermediate difficulty questions"""
+    """Test complete flow for intermediate difficulty questions with real debate processing"""
     from langgraph_mdm import create_mdm_graph
     
     # Create graph
@@ -60,15 +63,17 @@ def test_end_to_end_intermediate_processing():
     # Run the graph
     result = compiled_graph.invoke(initial_state)
     
-    # Verify results
+    # Verify results - now using real intermediate processing
     assert result["difficulty"] == "intermediate"
     assert result["processing_stage"] == "intermediate_complete"
-    assert result["final_decision"]["placeholder"] == "intermediate_result"
+    assert "final_decision" in result
+    # Should have real moderator consensus with majority_vote
+    assert "majority_vote" in result["final_decision"]
     assert "confidence" in result
     assert result["confidence"] > 0.0
 
 def test_end_to_end_advanced_processing():
-    """Test complete flow for advanced difficulty questions"""
+    """Test complete flow for advanced difficulty questions with real MDT processing"""
     from langgraph_mdm import create_mdm_graph
     
     # Create graph
@@ -88,10 +93,13 @@ def test_end_to_end_advanced_processing():
     # Run the graph
     result = compiled_graph.invoke(initial_state)
     
-    # Verify results
+    # Verify results - now using real advanced processing
     assert result["difficulty"] == "advanced"
     assert result["processing_stage"] == "advanced_complete"
-    assert result["final_decision"]["placeholder"] == "advanced_result"
+    assert "final_decision" in result
+    # Should have real coordinator decision with analysis
+    final_decision = result["final_decision"]
+    assert "analysis" in final_decision or "final_answer" in final_decision
 
 def test_graph_structure_and_nodes():
     """Test that graph has correct structure and all nodes"""

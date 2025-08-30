@@ -1,202 +1,416 @@
-import os
-import json
-import random
+#!/usr/bin/env python3
+"""
+LangGraph-based MDMAgents Production Entry Point
+Stage 6: Production-ready entry point for the LangGraph implementation.
+
+This module provides a complete replacement for main.py functionality using
+the LangGraph-based system while maintaining full compatibility with existing
+command-line arguments, output formats, and evaluation infrastructure.
+"""
+
 import argparse
-from tqdm import tqdm
-from termcolor import cprint
+import asyncio
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import logging
+from dotenv import load_dotenv
 
-# Assuming your utils.py is in the same directory or accessible via PYTHONPATH
-# Difficulty skip switches - set to True to skip processing that difficulty level
-SKIP_BASIC = False          # Skip basic difficulty questions
-SKIP_INTERMEDIATE = False  # Process intermediate difficulty questions  
-SKIP_ADVANCED = False       # Skip advanced difficulty questions
+# Load environment variables from .env file
+load_dotenv()
 
-from utils import (
-    # Agent, Group, parse_hierarchy, parse_group_info, # Not directly used in main
-    setup_model,
-    load_data, create_question, determine_difficulty,
-    process_basic_query, process_intermediate_query, process_advanced_query,
-    add_to_global_usage, get_global_token_usage, reset_global_token_usage
+# Import the integrated system
+from langgraph_integration import IntegratedMDMSystem
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='medqa', help="Dataset name (e.g., 'medqa')")
-parser.add_argument('--model', type=str, default='gemini-2.5-flash-lite-preview-06-17',
-                    help="Model to use (e.g., 'gemini-2.5-flash-lite-preview-06-17')")
-parser.add_argument('--difficulty', type=str, default='adaptive',
-                    choices=['adaptive', 'basic', 'intermediate', 'advanced'],
-                    help="Difficulty processing mode")
-parser.add_argument('--num_samples', type=int, default=1, help="Number of samples to process from the test set")
+logger = logging.getLogger(__name__)
 
 
-args = parser.parse_args()
-
-# Configure the model based on API keys.
-# setup_model now returns True on success, False on failure for essential configurations.
-cprint(f"[INFO] Setting up model: {args.model}", "cyan")
-configured_successfully = setup_model(args.model) # Assign the boolean return value
-if not configured_successfully: # Check the boolean
-    cprint(f"Failed to configure model {args.model}. Please check API keys and settings. Exiting.", "red")
-    exit(1)
-cprint(f"[INFO] Model {args.model} configured successfully.", "green")
-
-# Reset global token usage at the start
-reset_global_token_usage()
-
-
-# Load data
-cprint(f"[INFO] Loading data for dataset: {args.dataset}", "cyan")
-test_qa, examplers = load_data(args.dataset)
-if not test_qa:
-    cprint(f"No test data loaded for {args.dataset}. Exiting.", "red")
-    exit(1)
-cprint(f"[INFO] Loaded {len(test_qa)} test samples and {len(examplers)} exemplars.", "green")
-
-
-# agent_emoji list is defined here but process_intermediate_query in utils.py defines its own.
-# This list in main.py is currently not being passed or used by the util functions.
-# If it were intended to be used by utils, it should be passed as an argument.
-# For now, it's harmless but potentially redundant if utils always uses its internal list.
-# agent_emoji = ['\U0001F468\u200D\u2695\uFE0F', '\U0001F468\U0001F3FB\u200D\u2695\uFE0F', # ... rest of emojis ]
-# random.shuffle(agent_emoji)
-
-results = []
-num_to_process = min(args.num_samples, len(test_qa))
-cprint(f"[INFO] Starting processing for {num_to_process} samples...", "cyan")
-
-for no, sample in enumerate(tqdm(test_qa[:num_to_process], desc="Processing Samples")):
-    # if no == args.num_samples: # Handled by slicing test_qa[:num_to_process]
-    #     break
+class DatasetLoader:
+    """
+    Loads datasets in the same format as the original main.py.
+    Maintains compatibility with existing data structures.
+    """
     
-    cprint(f"\n[INFO] Processing sample no: {no+1}/{num_to_process}", "blue")
-    # total_api_calls = 0 # Initialized but not used. Can be removed or implemented if needed.
-
-    question, img_path = create_question(sample, args.dataset)
-    cprint(f"Question: {question[:30]}...", "white") # Print a snippet of the question
-
-    # Determine difficulty using the utility function
-    # The 'args.difficulty' string is passed, and 'determine_difficulty' handles 'adaptive' logic.
-    # 'determine_difficulty' now uses the specified model for adaptive assessment.
-    difficulty_level, difficulty_input_tokens, difficulty_output_tokens = determine_difficulty(question, args.difficulty, args.model)
-    cprint(f"Determined difficulty: {difficulty_level}", "yellow")
-
-    # Check if we should skip this difficulty level
-    if (difficulty_level == 'basic' and SKIP_BASIC):
-        cprint(f"Skipping basic difficulty sample {no+1} (SKIP_BASIC=True)", "cyan")
-        continue
-    elif (difficulty_level == 'intermediate' and SKIP_INTERMEDIATE):
-        cprint(f"Skipping intermediate difficulty sample {no+1} (SKIP_INTERMEDIATE=True)", "cyan")
-        continue  
-    elif (difficulty_level == 'advanced' and SKIP_ADVANCED):
-        cprint(f"Skipping advanced difficulty sample {no+1} (SKIP_ADVANCED=True)", "cyan")
-        continue
-
-    final_decision = None
-    sample_input_tokens = difficulty_input_tokens
-    sample_output_tokens = difficulty_output_tokens
+    @staticmethod
+    def load_jsonl(file_path: str) -> List[Dict[str, Any]]:
+        """Load JSONL file with medical questions"""
+        try:
+            data = []
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        data.append(json.loads(line))
+            return data
+        except Exception as e:
+            logger.error(f"Error loading dataset from {file_path}: {e}")
+            return []
     
-    if difficulty_level == 'basic':
-        final_decision, process_input_tokens, process_output_tokens = process_basic_query(question, args.model)
-        sample_input_tokens += process_input_tokens
-        sample_output_tokens += process_output_tokens
-    elif difficulty_level == 'intermediate':
-        final_decision, process_input_tokens, process_output_tokens = process_intermediate_query(question, args.model)
-        sample_input_tokens += process_input_tokens
-        sample_output_tokens += process_output_tokens
-    elif difficulty_level == 'advanced':
-        final_decision, process_input_tokens, process_output_tokens = process_advanced_query(question, args.model)
-        sample_input_tokens += process_input_tokens
-        sample_output_tokens += process_output_tokens
-    else:
-        cprint(f"Warning: Unknown difficulty level '{difficulty_level}' determined for sample {no+1}. Skipping.", "red")
-        continue
-
-    if final_decision is None:
-        cprint(f"Warning: No final decision received for sample {no+1} (Question: {question[:50]}...).", "red")
-        # Optionally, append a placeholder or skip
-        results.append({
-            'question_id': sample.get('id', f'sample_{no+1}'), # Assuming samples might have an ID
-            'question': question,
-            'label': sample.get('answer_idx', None) if args.dataset == 'medqa' else sample.get('label', None),
-            'answer': sample.get('answer', None),
-            'options': sample.get('options', None) if args.dataset == 'medqa' else None,
-            'response': "Error: No decision processed",
-            'difficulty': difficulty_level,
-            'token_usage': {
-                'input_tokens': 0,
-                'output_tokens': 0,
-                'total_tokens': 0
-            }
-        })
-        continue
+    @staticmethod
+    def create_question_text(question_data: Dict[str, Any]) -> tuple:
+        """Create formatted question text and extract metadata"""
+        question_text = question_data.get("question", "")
+        options = question_data.get("options", {})
+        answer_key = question_data.get("answer_idx", "")
+        
+        # Format options as list
+        option_list = []
+        if isinstance(options, dict):
+            for key in sorted(options.keys()):
+                option_list.append(f"{key}) {options[key]}")
+        elif isinstance(options, list):
+            option_list = options
+        
+        # Complete question with options
+        if option_list:
+            full_question = f"{question_text}\n\nOptions:\n" + "\n".join(option_list)
+        else:
+            full_question = question_text
+        
+        return full_question, option_list, answer_key
 
 
-    # Add token usage to global tracking
-    add_to_global_usage(sample_input_tokens, sample_output_tokens, no+1)
+class OutputManager:
+    """
+    Manages output file generation compatible with existing evaluation scripts.
+    Maintains the JSON format expected by evaluate_text_output.py.
+    """
     
-    # Print per-sample token usage
-    cprint(f"Sample {no+1} Token Usage - Input: {sample_input_tokens}, Output: {sample_output_tokens}, Total: {sample_input_tokens + sample_output_tokens}", "cyan")
-    # cprint(f"Final decision for sample {no+1}: {str(final_decision)[:100]}...", "green")
+    def __init__(self, output_dir: str = "output"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+    
+    def generate_filename(self, model_info: str, dataset: str, difficulty: str, 
+                         num_samples: int) -> str:
+        """Generate output filename matching original main.py pattern"""
+        # Clean model name for filename
+        model_clean = model_info.replace("-", "_").replace(".", "_")
+        
+        if difficulty == "adaptive":
+            filename = f"{model_clean}_{dataset}_{difficulty}_{num_samples}samples.json"
+        else:
+            filename = f"{model_clean}_{dataset}_{difficulty}_{num_samples}samples.json"
+        
+        return str(self.output_dir / filename)
+    
+    def save_results(self, results: List[Dict[str, Any]], output_filename: str, 
+                    metadata: Dict[str, Any] = None):
+        """Save results in format compatible with evaluation scripts"""
+        try:
+            # Prepare output structure
+            output_data = []
+            
+            for result in results:
+                # Extract core fields for compatibility
+                output_entry = {
+                    "question": result.get("question", ""),
+                    "options": result.get("options", []),
+                    "ground_truth": result.get("ground_truth", ""),
+                    "model_response": result.get("model_response", ""),
+                    "full_response": result.get("full_response", {}),
+                    "difficulty": result.get("difficulty", "unknown"),
+                    "token_usage": result.get("token_usage", {"input": 0, "output": 0}),
+                    "processing_time": result.get("processing_time", 0.0),
+                    "success": result.get("success", False)
+                }
+                
+                # Add processing metadata
+                if "processing_mode" in result:
+                    output_entry["processing_mode"] = result["processing_mode"]
+                if "error_info" in result:
+                    output_entry["error_info"] = result["error_info"]
+                
+                output_data.append(output_entry)
+            
+            # Add metadata if provided
+            if metadata:
+                final_output = {
+                    "metadata": metadata,
+                    "results": output_data
+                }
+            else:
+                final_output = output_data
+            
+            # Save to file
+            with open(output_filename, 'w', encoding='utf-8') as f:
+                json.dump(final_output, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Results saved to: {output_filename}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving results to {output_filename}: {e}")
+            return False
 
-    if args.dataset == 'medqa':
-        results.append({
-            'question_id': sample.get('id', f'sample_{no+1}'),
-            'question': question,
-            'label': sample['answer_idx'],
-            'answer': sample['answer'],
-            'options': sample['options'],
-            'response': final_decision, # This will be a dict like {0.0: "response_str"} or {'majority_vote': "response_str"}
-            'difficulty': difficulty_level,
-            'token_usage': {
-                'input_tokens': sample_input_tokens,
-                'output_tokens': sample_output_tokens,
-                'total_tokens': sample_input_tokens + sample_output_tokens
+
+async def process_dataset_async(system: IntegratedMDMSystem, dataset: List[Dict[str, Any]], 
+                               num_samples: Optional[int] = None, difficulty_filter: str = "adaptive") -> List[Dict[str, Any]]:
+    """Process dataset questions asynchronously through the integrated system"""
+    
+    if num_samples:
+        dataset = dataset[:num_samples]
+    
+    logger.info(f"Processing {len(dataset)} questions with difficulty filter: {difficulty_filter}")
+    
+    results = []
+    
+    for i, question_data in enumerate(dataset):
+        logger.info(f"Processing question {i+1}/{len(dataset)}")
+        
+        try:
+            # Create question and extract metadata
+            question_text, options, ground_truth = DatasetLoader.create_question_text(question_data)
+            
+            # Process through integrated system
+            result = await system.process_question(
+                question=question_text,
+                options=options,
+                ground_truth=ground_truth
+            )
+            
+            results.append(result)
+            
+            # Log progress every 10 questions
+            if (i + 1) % 10 == 0:
+                logger.info(f"Completed {i+1}/{len(dataset)} questions")
+                
+        except Exception as e:
+            logger.error(f"Error processing question {i+1}: {e}")
+            # Create error result
+            error_result = {
+                "question": question_data.get("question", ""),
+                "options": question_data.get("options", []),
+                "ground_truth": question_data.get("answer_idx", ""),
+                "model_response": "ERROR",
+                "full_response": {"error": str(e)},
+                "difficulty": "unknown",
+                "token_usage": {"input": 0, "output": 0},
+                "processing_time": 0.0,
+                "success": False,
+                "error_info": {"error": str(e), "question_index": i}
             }
-        })
-    else: # Generic result structure for other datasets
-        results.append({
-            'question_id': sample.get('id', f'sample_{no+1}'),
-            'question': question,
-            'label': sample.get('label', None), # Assuming other datasets might have a 'label' field
-            'response': final_decision,
-            'difficulty': difficulty_level,
-            'token_usage': {
-                'input_tokens': sample_input_tokens,
-                'output_tokens': sample_output_tokens,
-                'total_tokens': sample_input_tokens + sample_output_tokens
-            }
-        })
+            results.append(error_result)
+    
+    return results
 
 
-# Save results
-output_dir = os.path.join(os.getcwd(), 'output')
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
+def validate_environment():
+    """Validate required environment variables and API keys"""
+    required_env_vars = {
+        "genai_api_key": "Gemini API key",
+        "openai_api_key": "OpenAI API key"
+    }
+    
+    missing_vars = []
+    for var_name, description in required_env_vars.items():
+        if not os.getenv(var_name):
+            missing_vars.append(f"{var_name} ({description})")
+    
+    if missing_vars:
+        logger.warning(f"Missing environment variables: {', '.join(missing_vars)}")
+        logger.warning("Some models may not be available without proper API keys")
+        return False
+    
+    return True
 
-output_filename = f'{args.dataset}_{args.difficulty}_{num_to_process}samples_flash.json'
-output_path = os.path.join(output_dir, output_filename)
 
-try:
-    with open(output_path, 'w') as file:
-        json.dump(results, file, indent=4)
-    cprint(f"\n[INFO] Results saved to: {output_path}", "green")
-except Exception as e:
-    cprint(f"\n[ERROR] Failed to save results to {output_path}: {e}", "red")
+def setup_argument_parser() -> argparse.ArgumentParser:
+    """Setup command-line argument parser compatible with original main.py"""
+    parser = argparse.ArgumentParser(
+        description="LangGraph-based MDMAgents: Multi-agent medical decision making system"
+    )
+    
+    parser.add_argument(
+        "--dataset", 
+        type=str, 
+        default="medqa",
+        help="Dataset name (default: medqa)"
+    )
+    
+    parser.add_argument(
+        "--model", 
+        type=str, 
+        default="gemini-2.5-flash",
+        choices=[
+            "gemini-2.5-flash", 
+            "gemini-2.5-flash-lite-preview-06-17",
+            "gpt-4o-mini", 
+            "gpt-4.1-mini"
+        ],
+        help="Model to use for processing (default: gemini-2.5-flash)"
+    )
+    
+    parser.add_argument(
+        "--difficulty", 
+        type=str, 
+        default="adaptive",
+        choices=["basic", "intermediate", "advanced", "adaptive"],
+        help="Processing difficulty mode (default: adaptive)"
+    )
+    
+    parser.add_argument(
+        "--num_samples", 
+        type=int, 
+        help="Number of samples to process (default: all)"
+    )
+    
+    parser.add_argument(
+        "--output_dir", 
+        type=str, 
+        default="output",
+        help="Output directory (default: output)"
+    )
+    
+    parser.add_argument(
+        "--data_dir", 
+        type=str, 
+        default="data",
+        help="Data directory (default: data)"
+    )
+    
+    parser.add_argument(
+        "--verbose", 
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    
+    parser.add_argument(
+        "--test_mode", 
+        action="store_true",
+        help="Run in test mode with minimal samples"
+    )
+    
+    return parser
 
-# Print total token usage summary
-global_usage = get_global_token_usage()
-cprint("\n" + "="*50, "magenta")
-cprint("TOTAL TOKEN USAGE SUMMARY", "magenta")
-cprint("="*50, "magenta")
-cprint(f"Total Input Tokens: {global_usage['total_input_tokens']:,}", "yellow")
-cprint(f"Total Output Tokens: {global_usage['total_output_tokens']:,}", "yellow")
-cprint(f"Total Tokens: {global_usage['total_input_tokens'] + global_usage['total_output_tokens']:,}", "yellow")
-cprint(f"Processed {len(global_usage['sample_usage'])} samples", "yellow")
-if global_usage['sample_usage']:
-    avg_input = global_usage['total_input_tokens'] / len(global_usage['sample_usage'])
-    avg_output = global_usage['total_output_tokens'] / len(global_usage['sample_usage'])
-    cprint(f"Average Input Tokens per Sample: {avg_input:.1f}", "yellow")
-    cprint(f"Average Output Tokens per Sample: {avg_output:.1f}", "yellow")
-cprint("="*50, "magenta")
 
-cprint("[INFO] Processing complete.", "magenta")
+async def main():
+    """Main entry point for LangGraph-based MDMAgents system"""
+    
+    # Parse arguments
+    parser = setup_argument_parser()
+    args = parser.parse_args()
+    
+    # Setup logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    logger.info("Starting LangGraph-based MDMAgents system")
+    logger.info(f"Arguments: {vars(args)}")
+    
+    # Validate environment
+    validate_environment()
+    
+    # Test mode override
+    if args.test_mode:
+        args.num_samples = min(args.num_samples or 5, 5)
+        logger.info(f"Test mode enabled, processing {args.num_samples} samples")
+    
+    try:
+        # Load dataset
+        data_path = Path(args.data_dir) / args.dataset / "test.jsonl"
+        if not data_path.exists():
+            logger.error(f"Dataset file not found: {data_path}")
+            sys.exit(1)
+        
+        logger.info(f"Loading dataset from: {data_path}")
+        dataset = DatasetLoader.load_jsonl(str(data_path))
+        
+        if not dataset:
+            logger.error("No data loaded from dataset file")
+            sys.exit(1)
+        
+        logger.info(f"Loaded {len(dataset)} questions from dataset")
+        
+        # Initialize integrated system
+        logger.info(f"Initializing system with model: {args.model}")
+        system = IntegratedMDMSystem(model_info=args.model)
+        
+        # Process dataset
+        start_time = time.time()
+        results = await process_dataset_async(
+            system=system,
+            dataset=dataset,
+            num_samples=args.num_samples,
+            difficulty_filter=args.difficulty
+        )
+        processing_time = time.time() - start_time
+        
+        logger.info(f"Processing completed in {processing_time:.2f} seconds")
+        
+        # Generate output filename
+        output_manager = OutputManager(args.output_dir)
+        num_processed = len(results)
+        output_filename = output_manager.generate_filename(
+            args.model, args.dataset, args.difficulty, num_processed
+        )
+        
+        # Prepare metadata
+        system_status = system.get_system_status()
+        system_metrics = system_status["system_metrics"]
+        
+        metadata = {
+            "model": args.model,
+            "dataset": args.dataset,
+            "difficulty_mode": args.difficulty,
+            "total_questions": num_processed,
+            "processing_time": processing_time,
+            "system_metrics": system_metrics.to_dict() if hasattr(system_metrics, 'to_dict') else system_metrics,
+            "performance_report": system_status["performance_report"],
+            "timestamp": time.time(),
+            "langgraph_version": "Stage 6 Complete"
+        }
+        
+        # Save results
+        success = output_manager.save_results(results, output_filename, metadata)
+        
+        if success:
+            logger.info("=" * 50)
+            logger.info("PROCESSING COMPLETE")
+            logger.info("=" * 50)
+            logger.info(f"Model: {args.model}")
+            logger.info(f"Dataset: {args.dataset}")
+            logger.info(f"Questions processed: {num_processed}")
+            logger.info(f"Processing time: {processing_time:.2f} seconds")
+            logger.info(f"Output file: {output_filename}")
+            
+            # Display system metrics
+            metrics = system_status["system_metrics"]
+            if hasattr(metrics, '__dict__'):
+                logger.info(f"Success rate: {metrics.success_rate:.1%}")
+                logger.info(f"Total tokens: {metrics.total_token_usage['input'] + metrics.total_token_usage['output']:,}")
+                logger.info(f"Processing modes: {dict(metrics.processing_modes_used)}")
+            
+            logger.info("=" * 50)
+        else:
+            logger.error("Failed to save results")
+            sys.exit(1)
+            
+    except KeyboardInterrupt:
+        logger.info("Processing interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def sync_main():
+    """Synchronous wrapper for main function"""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    sync_main()

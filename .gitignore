@@ -52,6 +52,8 @@ output/
 claude-instructions.md
 *.md
 !README.mds
+old_utils.py
+old_main.py
 
 # Large files
 *.jsonl
