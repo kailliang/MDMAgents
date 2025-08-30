@@ -50,6 +50,8 @@ imgs/
 evaluation/
 output/
 claude-instructions.md
+*.md
+!README.mds
 
 # Large files
 *.jsonl
