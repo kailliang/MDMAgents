@@ -92,12 +92,12 @@ class OutputManager:
                          num_samples: int) -> str:
         """Generate output filename matching original main.py pattern"""
         # Clean model name for filename
-        model_clean = model_info.replace("-", "_").replace(".", "_")
+        model_clean = model_info.replace("-", "_").replace(".", "_")[11:]
         
         if difficulty == "adaptive":
-            filename = f"{model_clean}_{dataset}_{difficulty}_{num_samples}samples.json"
+            filename = f"{model_clean}_{dataset[:3]}_{difficulty[:3]}_{num_samples}_smpl.json"
         else:
-            filename = f"{model_clean}_{dataset}_{difficulty}_{num_samples}samples.json"
+            filename = f"{model_clean}_{dataset[:3]}_{difficulty[:3]}_{num_samples}_smpl.json"
         
         return str(self.output_dir / filename)
     
@@ -152,7 +152,7 @@ class OutputManager:
 
 
 async def process_dataset_async(system: IntegratedMDMSystem, dataset: List[Dict[str, Any]], 
-                               num_samples: Optional[int] = None, difficulty_filter: str = "adaptive") -> List[Dict[str, Any]]:
+                               num_samples: Optional[int] = None, difficulty_filter: str = "adaptive", verbose: bool = False) -> List[Dict[str, Any]]:
     """Process dataset questions asynchronously through the integrated system"""
     
     if num_samples:
@@ -161,26 +161,31 @@ async def process_dataset_async(system: IntegratedMDMSystem, dataset: List[Dict[
     logger.info(f"Processing {len(dataset)} questions with difficulty filter: {difficulty_filter}")
     
     results = []
+    total_questions = len(dataset)
     
     for i, question_data in enumerate(dataset):
-        logger.info(f"Processing question {i+1}/{len(dataset)}")
+        # Clear separator for each sample
+        logger.info("=" * 60)
+        logger.info(f"PROCESSING QUESTION {i+1}/{total_questions}")
+        logger.info("=" * 60)
         
         try:
             # Create question and extract metadata
             question_text, options, ground_truth = DatasetLoader.create_question_text(question_data)
             
             # Process through integrated system
+            # Pass forced difficulty if not adaptive
+            forced_diff = None if difficulty_filter == "adaptive" else difficulty_filter
             result = await system.process_question(
                 question=question_text,
                 options=options,
-                ground_truth=ground_truth
+                ground_truth=ground_truth,
+                forced_difficulty=forced_diff
             )
             
             results.append(result)
             
-            # Log progress every 10 questions
-            if (i + 1) % 10 == 0:
-                logger.info(f"Completed {i+1}/{len(dataset)} questions")
+            # Remove redundant progress logging - handled above
                 
         except Exception as e:
             logger.error(f"Error processing question {i+1}: {e}")
@@ -241,6 +246,7 @@ def setup_argument_parser() -> argparse.ArgumentParser:
         default="gemini-2.5-flash",
         choices=[
             "gemini-2.5-flash", 
+            "gemini-2.5-flash-lite",
             "gemini-2.5-flash-lite-preview-06-17",
             "gpt-4o-mini", 
             "gpt-4.1-mini"
@@ -283,6 +289,12 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     )
     
     parser.add_argument(
+        "--quiet", 
+        action="store_true",
+        help="Minimal output (errors only)"
+    )
+    
+    parser.add_argument(
         "--test_mode", 
         action="store_true",
         help="Run in test mode with minimal samples"
@@ -299,8 +311,12 @@ async def main():
     args = parser.parse_args()
     
     # Setup logging level
-    if args.verbose:
+    if args.quiet:
+        logging.getLogger().setLevel(logging.ERROR)
+    elif args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        logging.getLogger().setLevel(logging.INFO)
     
     logger.info("Starting LangGraph-based MDMAgents system")
     logger.info(f"Arguments: {vars(args)}")
@@ -339,7 +355,8 @@ async def main():
             system=system,
             dataset=dataset,
             num_samples=args.num_samples,
-            difficulty_filter=args.difficulty
+            difficulty_filter=args.difficulty,
+            verbose=args.verbose
         )
         processing_time = time.time() - start_time
         
@@ -361,7 +378,6 @@ async def main():
             "dataset": args.dataset,
             "difficulty_mode": args.difficulty,
             "total_questions": num_processed,
-            "processing_time": processing_time,
             "system_metrics": system_metrics.to_dict() if hasattr(system_metrics, 'to_dict') else system_metrics,
             "performance_report": system_status["performance_report"],
             "timestamp": time.time(),

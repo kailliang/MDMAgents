@@ -15,6 +15,7 @@ Based on existing process_intermediate_query function in utils.py:757+
 
 import json
 import re
+import asyncio
 from typing import Dict, List, Any, Optional, TypedDict
 from langgraph.graph import StateGraph
 from langgraph.types import Command
@@ -26,6 +27,7 @@ class IntermediateProcessingState(TypedDict, total=False):
     # Core fields
     messages: List[Any]
     question: str
+    answer_options: Optional[List[str]]
     token_usage: Dict[str, int]
     processing_stage: str
     final_decision: Optional[Dict]
@@ -33,7 +35,6 @@ class IntermediateProcessingState(TypedDict, total=False):
     # Intermediate processing specific
     experts_hierarchy: List[Dict]
     round_number: int
-    turn_number: int
     interaction_log: Dict
     round_opinions: Dict
     participation_decisions: List[Dict]
@@ -181,6 +182,20 @@ class DebateParticipationNode:
             "output_tokens": usage["output_tokens"]
         }
     
+    async def _call_llm_async(self, prompt: str) -> tuple[str, Dict[str, int]]:
+        """Make async LLM call and return response with token usage"""
+        # Wrap the sync call in asyncio.to_thread for true async behavior
+        def sync_call():
+            agent = self._get_agent()
+            response = agent.chat(prompt)
+            usage = agent.get_token_usage()
+            return response, {
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"]
+            }
+        
+        return await asyncio.to_thread(sync_call)
+    
     def decide_participation(self, state: IntermediateProcessingState) -> Command:
         """Decide whether to participate in current debate round"""
         round_num = state.get("round_number", 1)
@@ -218,8 +233,7 @@ Return your response in JSON format:
             "expert_id": self.expert["id"],
             "participate": participate,
             "reason": reason,
-            "round": round_num,
-            "turn": state.get("turn_number", 1)
+            "round": round_num
         }
         
         current_usage = state.get("token_usage", {"input": 0, "output": 0})
@@ -456,7 +470,6 @@ Limit your answer to 50 words."""
             update={
                 "round_opinions": round_opinions,
                 "round_number": round_num + 1,
-                "turn_number": 1,
                 "token_usage": updated_usage
             },
             goto="check_next_round"
@@ -493,25 +506,63 @@ class ModeratorConsensusNode:
     def build_consensus(self, state: IntermediateProcessingState) -> Command:
         """Build final consensus from expert opinions"""
         question = state["question"]
+        answer_options = state.get("answer_options", [])
         final_opinions = state.get("final_expert_opinions", {})
         
         # Format expert opinions
         opinions_text = "\n".join([f"{k}: {v}" for k, v in final_opinions.items()])
         
-        consensus_prompt = f"""Given each expert's final answer, please review and make the final decision.
+        # Format answer options for display
+        options_text = "\n".join(answer_options) if answer_options else "No options provided"
+        
+        consensus_prompt = f"""Given each expert's final answer, please review and make the final decision in JSON format.
 
 Expert Opinions:
 {opinions_text}
 
 Question: {question}
 
-Only respond with the correct option and answer, in this format: Answer: X) Example Answer"""
+**Answer Options:**
+{options_text}
+
+Provide your final decision in exactly this JSON format:
+
+{{
+  "majority_vote": "X) Example Answer",
+  "reasoning": "Brief explanation of the consensus decision"
+}}
+
+**Requirements:**
+- Final answer must correspond to one of the provided options
+- Return ONLY the JSON, no other text
+"""
         
         response, token_usage = self._call_llm(consensus_prompt)
         
+        # Parse JSON response to extract clean answer
+        try:
+            # Try to extract JSON from response
+            json_match = re.search(r'\{[^{}]*"majority_vote"\s*:\s*"([^"]*)"[^{}]*\}', response, re.DOTALL)
+            if json_match:
+                majority_vote = json_match.group(1)
+            else:
+                # Fallback - try to parse as full JSON
+                import json
+                clean_response = response.strip()
+                if clean_response.startswith('```json\n'):
+                    clean_response = clean_response[8:-3].strip()  # Remove ```json\n and \n```
+                
+                parsed = json.loads(clean_response)
+                majority_vote = parsed.get("majority_vote", "Parse error")
+        except Exception as e:
+            # Final fallback - extract any answer-like pattern
+            answer_match = re.search(r'[A-E]\)\s*[^"]*', response)
+            majority_vote = answer_match.group(0) if answer_match else "Parse error"
+        
         # Create final decision
         final_decision = {
-            "majority_vote": response,
+            "majority_vote": majority_vote,
+            "raw_response": response,  # Keep full response for debugging
             "expert_count": len(final_opinions),
             "consensus_method": "moderator_synthesis"
         }
@@ -665,31 +716,340 @@ def create_intermediate_processing_subgraph(model_info: str = "gemini-2.5-flash"
         return {
             **state,
             "round_opinions": round_opinions,
-            "round_number": 1,
-            "turn_number": 1
+            "round_number": 1
         }
     
-    def simplified_debate(state: IntermediateProcessingState) -> Dict[str, Any]:
-        """Simplified debate process"""
-        # For initial implementation, skip to final opinions
-        experts = state.get("experts_hierarchy", [])
+    def parse_combined_decision(response: str) -> Dict[str, Any]:
+        """Parse combined participation and selection JSON response"""
+        try:
+            data = json.loads(response.strip())
+            return {
+                'participate': data.get('participate', False),
+                'reason': data.get('reason', ''),
+                'selected_experts': data.get('selected_experts', []),
+                'selection_reason': data.get('selection_reason', '')
+            }
+        except (json.JSONDecodeError, TypeError):
+            # Fallback parsing
+            should_participate = 'yes' in response.lower() or 'true' in response.lower() or '"participate": true' in response.lower()
+            reason = response[:100] if response else "Parsed from text"
+            
+            # Try to extract expert IDs from text
+            selected_experts = []
+            if should_participate:
+                import re
+                # Look for numbers that could be expert IDs
+                numbers = re.findall(r'\b([1-9])\b', response)
+                selected_experts = [int(n) for n in numbers[:3]]  # Limit to reasonable number
+            
+            return {
+                'participate': should_participate,
+                'reason': reason,
+                'selected_experts': selected_experts,
+                'selection_reason': 'Extracted from text'
+            }
+    
+    async def get_participation_and_selection_async(expert: Dict, assessment_str: str, 
+                                                   expert_list: str, model_info: str) -> tuple[Dict[str, Any], Dict[str, int]]:
+        """Get combined participation decision and expert selection"""
+        participation_node = DebateParticipationNode(expert, model_info)
         
-        final_opinions = {}
-        for expert in experts:
-            role = expert.get("role", "expert").lower()
-            final_opinions[role] = f"Final opinion from {role}"
+        combined_prompt = f"""Given the opinions from other medical experts in your team, decide:
+1. Do you want to participate in this round's discussion?
+2. If yes, which expert(s) do you want to communicate with?
+
+Current Opinions:
+{assessment_str}
+
+Available Experts:
+{expert_list}
+
+Response in JSON format:
+{{
+  "participate": true/false,
+  "reason": "brief explanation",
+  "selected_experts": [1, 3],
+  "selection_reason": "why I chose these experts"
+}}
+
+If you don't want to participate:
+{{
+  "participate": false,
+  "reason": "I agree with current assessments", 
+  "selected_experts": [],
+  "selection_reason": ""
+}}"""
+        
+        response, token_usage = await participation_node._call_llm_async(combined_prompt)
+        decision = parse_combined_decision(response)
+        return decision, token_usage
+    
+    async def generate_communication_async(source_expert: Dict, target_expert: Dict, 
+                                         question: str, model_info: str) -> tuple[str, Dict[str, int]]:
+        """Generate communication from source expert to target expert"""
+        participation_node = DebateParticipationNode(source_expert, model_info)
+        
+        comm_prompt = f"""Please remind your medical expertise and then leave your opinion/question for an expert you chose (Agent {target_expert['id']}. {target_expert['role']}). 
+You should deliver your opinion once you are confident enough and in a way to convince other expert. Limit your response with no more than 200 words.
+
+Question: {question}"""
+        
+        return await participation_node._call_llm_async(comm_prompt)
+    
+    async def collect_expert_opinion_async(expert: Dict, round_num: int, question: str, 
+                                         model_info: str) -> tuple[str, Dict[str, int]]:
+        """Collect expert opinion after round discussions"""
+        opinion_agent = LangGraphAgent(
+            instruction=f"You are a {expert['role']} reflecting on the discussion.",
+            role=expert['role'].lower(),
+            model_info=model_info
+        )
+        
+        opinion_prompt = f"Reflecting on the discussions in Round {round_num}, what is your current answer/opinion on the question: {question}\n Limit your answer within 50 words"
+        
+        def sync_call():
+            response = opinion_agent.chat(opinion_prompt)
+            usage = opinion_agent.get_token_usage()
+            return response, {
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"]
+            }
+        
+        return await asyncio.to_thread(sync_call)
+    
+    async def collect_final_opinion_async(expert: Dict, question: str, 
+                                        model_info: str) -> tuple[str, Dict[str, int]]:
+        """Collect final expert opinion"""
+        final_agent = LangGraphAgent(
+            instruction=f"You are a {expert['role']} making final assessment.",
+            role=expert['role'].lower(),
+            model_info=model_info
+        )
+        
+        final_prompt = f"Now that you've interacted with other medical experts, remind your expertise and the comments from other experts and make your final answer to the given question:\n{question}\n limit your answer within 50 words."
+        
+        def sync_call():
+            response = final_agent.chat(final_prompt)
+            usage = final_agent.get_token_usage()
+            return response, {
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"]
+            }
+        
+        return await asyncio.to_thread(sync_call)
+    
+    def multi_round_debate(state: IntermediateProcessingState) -> Dict[str, Any]:
+        """Conduct multi-round debate with participation consent system - OPTIMIZED with parallel processing"""
+        # Run the async version internally using existing event loop or create new one
+        import asyncio
+        try:
+            # Try to get the current event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is already running, we need to create a task and wait
+                # For now, fall back to a simpler approach - run in thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, _multi_round_debate_async(state))
+                    return future.result()
+            else:
+                return loop.run_until_complete(_multi_round_debate_async(state))
+        except RuntimeError:
+            # No event loop exists, create a new one
+            return asyncio.run(_multi_round_debate_async(state))
+    
+    async def _multi_round_debate_async(state: IntermediateProcessingState) -> Dict[str, Any]:
+        """Conduct multi-round debate with participation consent system - OPTIMIZED with parallel processing"""
+        experts = state.get("experts_hierarchy", [])
+        question = state["question"]
+        current_round = state.get("round_number", 1)
+        max_rounds = 3
+        
+        # Initialize tracking variables
+        total_tokens = {"input": 0, "output": 0}
+        interaction_log = state.get("interaction_log", {})
+        round_opinions = state.get("round_opinions", {})
+        
+        # Prepare expert list for selection prompts
+        expert_list = "\n".join([f"{e['id']}. {e['role']}" for e in experts])
+        
+        # Main debate loop for remaining rounds
+        for round_num in range(current_round, max_rounds + 1):
+            if round_num not in round_opinions:
+                continue
+                
+            round_name = f"Round {round_num}"
+            if round_name not in interaction_log:
+                interaction_log[round_name] = {}
+            
+            # Current assessment for participation decisions
+            current_assessment = round_opinions.get(round_num, {})
+            assessment_str = "\n".join([f"({k}): {v}" for k, v in current_assessment.items()])
+            
+            # PARALLEL EXECUTION: Get all participation decisions + selections at once
+            participation_tasks = [
+                get_participation_and_selection_async(expert, assessment_str, expert_list, model_info)
+                for expert in experts
+            ]
+            
+            try:
+                participation_results = await asyncio.gather(*participation_tasks)
+            except Exception as e:
+                print(f"Error in parallel participation: {e}")
+                # Fallback to sequential processing
+                participation_results = []
+                for expert in experts:
+                    result = await get_participation_and_selection_async(expert, assessment_str, expert_list, model_info)
+                    participation_results.append(result)
+            
+            # Process participation results
+            any_participated = False
+            expert_decisions = {}
+            
+            for i, (decision, token_usage) in enumerate(participation_results):
+                expert = experts[i]
+                expert_decisions[expert['id']] = decision
+                
+                # Update token usage
+                total_tokens["input"] += token_usage["input_tokens"]
+                total_tokens["output"] += token_usage["output_tokens"]
+                
+                if decision['participate']:
+                    any_participated = True
+            
+            # Generate communications in parallel for participating experts
+            communication_tasks = []
+            for expert in experts:
+                decision = expert_decisions[expert['id']]
+                if decision['participate'] and decision['selected_experts']:
+                    # Create communication tasks for each selected target expert
+                    for target_id in decision['selected_experts']:
+                        if 1 <= target_id <= len(experts):
+                            target_expert = next((e for e in experts if e["id"] == target_id), None)
+                            if target_expert:
+                                task = generate_communication_async(expert, target_expert, question, model_info)
+                                communication_tasks.append((expert, target_expert, task))
+            
+            # PARALLEL EXECUTION: Execute all communications at once
+            if communication_tasks:
+                try:
+                    # Extract just the tasks for parallel execution
+                    task_list = [task_info[2] for task_info in communication_tasks]
+                    communication_results = await asyncio.gather(*task_list)
+                    
+                    # Process communication results and log interactions
+                    for i, (source_expert, target_expert, _) in enumerate(communication_tasks):
+                        comm_response, comm_tokens = communication_results[i]
+                        
+                        # Update token usage
+                        total_tokens["input"] += comm_tokens["input_tokens"]
+                        total_tokens["output"] += comm_tokens["output_tokens"]
+                        
+                        # Log the interaction
+                        source_key = f"Agent {source_expert['id']}"
+                        target_key = f"Agent {target_expert['id']}"
+                        if source_key not in interaction_log[round_name]:
+                            interaction_log[round_name][source_key] = {}
+                        interaction_log[round_name][source_key][target_key] = comm_response
+                        
+                except Exception as e:
+                    print(f"Error in parallel communications: {e}")
+                    # Fallback to sequential processing for communications
+                    for source_expert, target_expert, task in communication_tasks:
+                        try:
+                            comm_response, comm_tokens = await task
+                            total_tokens["input"] += comm_tokens["input_tokens"]
+                            total_tokens["output"] += comm_tokens["output_tokens"]
+                            
+                            source_key = f"Agent {source_expert['id']}"
+                            target_key = f"Agent {target_expert['id']}"
+                            if source_key not in interaction_log[round_name]:
+                                interaction_log[round_name][source_key] = {}
+                            interaction_log[round_name][source_key][target_key] = comm_response
+                        except Exception as task_error:
+                            print(f"Error in individual communication task: {task_error}")
+            
+            # If no one participated in this round (after round 1), end debate
+            if not any_participated and round_num > 1:
+                break
+                
+            # PARALLEL EXECUTION: Collect updated opinions for next round  
+            if round_num < max_rounds:
+                opinion_tasks = [
+                    collect_expert_opinion_async(expert, round_num, question, model_info)
+                    for expert in experts
+                ]
+                
+                try:
+                    opinion_results = await asyncio.gather(*opinion_tasks)
+                    next_round_opinions = {}
+                    
+                    for i, (opinion_response, usage) in enumerate(opinion_results):
+                        expert = experts[i]
+                        total_tokens["input"] += usage["input_tokens"]
+                        total_tokens["output"] += usage["output_tokens"]
+                        next_round_opinions[expert['role'].lower()] = opinion_response
+                    
+                    round_opinions[round_num + 1] = next_round_opinions
+                    
+                except Exception as e:
+                    print(f"Error in parallel opinion collection: {e}")
+                    # Fallback to sequential processing
+                    next_round_opinions = {}
+                    for expert in experts:
+                        opinion_response, usage = await collect_expert_opinion_async(expert, round_num, question, model_info)
+                        total_tokens["input"] += usage["input_tokens"]
+                        total_tokens["output"] += usage["output_tokens"]
+                        next_round_opinions[expert['role'].lower()] = opinion_response
+                    round_opinions[round_num + 1] = next_round_opinions
+        
+        # PARALLEL EXECUTION: Collect final opinions from all experts
+        final_opinion_tasks = [
+            collect_final_opinion_async(expert, question, model_info)
+            for expert in experts
+        ]
+        
+        try:
+            final_opinion_results = await asyncio.gather(*final_opinion_tasks)
+            final_opinions = {}
+            
+            for i, (final_response, usage) in enumerate(final_opinion_results):
+                expert = experts[i]
+                total_tokens["input"] += usage["input_tokens"]
+                total_tokens["output"] += usage["output_tokens"]
+                final_opinions[expert['role']] = final_response
+                
+        except Exception as e:
+            print(f"Error in parallel final opinion collection: {e}")
+            # Fallback to sequential processing
+            final_opinions = {}
+            for expert in experts:
+                final_response, usage = await collect_final_opinion_async(expert, question, model_info)
+                total_tokens["input"] += usage["input_tokens"]
+                total_tokens["output"] += usage["output_tokens"]
+                final_opinions[expert['role']] = final_response
+        
+        # Update token usage
+        current_usage = state.get("token_usage", {"input": 0, "output": 0})
+        updated_usage = {
+            "input": current_usage["input"] + total_tokens["input"],
+            "output": current_usage["output"] + total_tokens["output"]
+        }
         
         return {
             **state,
+            "interaction_log": interaction_log,
+            "round_opinions": round_opinions,
             "final_expert_opinions": final_opinions,
-            "round_number": 3,
+            "round_number": max_rounds,
+            "token_usage": updated_usage,
             "processing_stage": "debate_complete"
         }
     
     # Add nodes to subgraph
     subgraph.add_node("recruit_experts", recruiter.recruit_experts)
     subgraph.add_node("initial_opinions", collect_initial_opinions)
-    subgraph.add_node("debate_process", simplified_debate)
+    subgraph.add_node("debate_process", multi_round_debate)
     subgraph.add_node("moderator_consensus", moderator.build_consensus)
     subgraph.add_node("intermediate_complete", intermediate_processing_placeholder)
     
@@ -715,7 +1075,6 @@ if __name__ == "__main__":
         "question": "Complex medical case requiring expert debate",
         "token_usage": {"input": 0, "output": 0},
         "round_number": 1,
-        "turn_number": 1,
         "interaction_log": {},
         "round_opinions": {}
     }

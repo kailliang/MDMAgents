@@ -158,20 +158,27 @@ class ExpertAnalysisNode:
     def analyze_question(self, state: MDMStateDict) -> Command:
         """Analyze the medical question and provide structured JSON response"""
         question = state["question"]
+        answer_options = state.get("answer_options", [])
         expert = self.expert_data
+        
+        # Format answer options for display
+        options_text = "\n".join(answer_options) if answer_options else "No options provided"
         
         expert_prompt = f"""You are a {expert['role']}. Analyze the following multiple choice question and provide your response in exactly this JSON format:
 
 {{
   "reasoning": "Your step-by-step medical analysis in no more than 300 words",
-  "answer": "X) Example Answer "
+  "answer": "X) Example Answer"
 }}
+
+**Question:** {question}
+
+**Answer Options:**
+{options_text}
 
 **Requirements:**
 - Answer must correspond to one of the provided options
 - Return ONLY the JSON, no other text
-
-**Question:** {question}
 """
         
         response, token_usage = self._call_llm(expert_prompt)
@@ -245,6 +252,10 @@ def parallel_expert_analysis(state: MDMStateDict) -> List[Send]:
     """Create Send commands for parallel expert analysis using LangGraph Send API"""
     experts = state.get("experts", [])
     
+    # Handle case where no experts are recruited yet
+    if not experts:
+        return []
+    
     # Create Send command for each expert to process in parallel
     send_commands = []
     for expert in experts:
@@ -300,6 +311,7 @@ class ArbitratorNode:
     def make_final_decision(self, state: MDMStateDict) -> Command:
         """Synthesize expert opinions and make final decision"""
         question = state["question"]
+        answer_options = state.get("answer_options", [])
         expert_responses = state.get("expert_responses", [])
         
         # Format expert responses for arbitrator
@@ -309,11 +321,17 @@ class ArbitratorNode:
             experts_summary += f"Reasoning: {response['reasoning']}\n"
             experts_summary += f"Answer: {response['answer']}\n\n"
         
+        # Format answer options for display
+        options_text = "\n".join(answer_options) if answer_options else "No options provided"
+        
         arbitrator_prompt = f"""You are a medical arbitrator. Review the following expert opinions and provide your final decision in JSON format:
 
 {experts_summary}
 
 Question: {question}
+
+**Answer Options:**
+{options_text}
 
 Analyze all expert opinions and provide your final decision in exactly this JSON format:
 
@@ -430,9 +448,70 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
             "processing_stage": "expert_analysis_complete"
         }
     
-    # Add nodes to subgraph
+    # Create a parallel expert processing function using async pattern
+    def parallel_expert_processing(state: MDMStateDict) -> Dict[str, Any]:
+        """Process all experts in parallel using async pattern internally"""
+        import asyncio
+        
+        def run_parallel_analysis():
+            return asyncio.run(_parallel_expert_analysis_async(state))
+        
+        # Handle async execution within sync function
+        try:
+            return run_parallel_analysis()
+        except RuntimeError:
+            # Fallback to threaded execution if event loop is running
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, _parallel_expert_analysis_async(state))
+                return future.result()
+    
+    async def _parallel_expert_analysis_async(state: MDMStateDict) -> Dict[str, Any]:
+        """Async helper for parallel expert analysis"""
+        experts = state.get("experts", [])
+        if not experts:
+            return {**state, "expert_responses": [], "processing_stage": "no_experts"}
+        
+        # Create async tasks for each expert
+        async def analyze_expert_async(expert):
+            def sync_analysis():
+                expert_node = ExpertAnalysisNode(expert, model_info)
+                result = expert_node.analyze_question({**state, "current_expert": expert})
+                return result.update
+            
+            return await asyncio.to_thread(sync_analysis)
+        
+        # Run all expert analyses in parallel
+        try:
+            expert_tasks = [analyze_expert_async(expert) for expert in experts]
+            results = await asyncio.gather(*expert_tasks)
+            
+            # Collect all expert responses
+            expert_responses = []
+            total_token_usage = state.get("token_usage", {"input": 0, "output": 0})
+            
+            for result_update in results:
+                if "expert_response" in result_update:
+                    expert_responses.append(result_update["expert_response"])
+                if "token_usage" in result_update:
+                    total_token_usage["input"] += result_update["token_usage"]["input"]  
+                    total_token_usage["output"] += result_update["token_usage"]["output"]
+            
+            return {
+                **state,
+                "expert_responses": expert_responses,
+                "token_usage": total_token_usage,
+                "processing_stage": "expert_analysis_complete"
+            }
+            
+        except Exception as e:
+            print(f"Error in parallel expert analysis: {e}")
+            # Fallback to sequential processing
+            return process_all_experts(state)
+    
+    # Add nodes to subgraph  
     subgraph.add_node("expert_recruitment", recruiter.recruit_experts)
-    subgraph.add_node("expert_analysis", process_all_experts)
+    subgraph.add_node("expert_analysis", parallel_expert_processing)
     subgraph.add_node("arbitrator", arbitrator.make_final_decision)
     subgraph.add_node("basic_complete", basic_processing_placeholder)
     

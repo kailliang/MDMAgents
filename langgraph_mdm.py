@@ -35,10 +35,10 @@ class LangGraphAgent:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         
-        logger.info(f"Initializing LangGraphAgent: {role} with model {model_info}")
+        logger.debug(f"Initializing LangGraphAgent: {role} with model {model_info}")
         
         # Initialize model based on type
-        if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17']:
+        if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-lite-preview-06-17']:
             self._init_gemini()
         elif self.model_info in ['gpt-4o-mini', 'gpt-4.1-mini']:
             self._init_openai()
@@ -75,7 +75,7 @@ class LangGraphAgent:
         logger.debug(f"Input message length: {len(str(message))} characters")
         
         try:
-            if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17']:
+            if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-lite-preview-06-17']:
                 return self._call_gemini(message)
             elif self.model_info in ['gpt-4o-mini', 'gpt-4.1-mini']:
                 return self._call_openai(message)
@@ -109,7 +109,7 @@ class LangGraphAgent:
                     logger.debug(f"Output tokens: {output_tokens}")
             
             response_text = response.text
-            logger.info(f"LLM call successful - Agent: {self.role}, Response length: {len(response_text)}")
+            logger.debug(f"LLM call successful - Agent: {self.role}, Response length: {len(response_text)}")
             logger.debug(f"Response preview: {response_text[:100]}...")
             
             return response_text
@@ -141,7 +141,7 @@ class LangGraphAgent:
                 logger.debug(f"Input tokens: {input_tokens}, Output tokens: {output_tokens}")
             
             response_text = response.choices[0].message.content
-            logger.info(f"LLM call successful - Agent: {self.role}, Response length: {len(response_text)}")
+            logger.debug(f"LLM call successful - Agent: {self.role}, Response length: {len(response_text)}")
             logger.debug(f"Response preview: {response_text[:100]}...")
             
             return response_text
@@ -169,6 +169,7 @@ class MDMStateDict(TypedDict):
     """
     messages: Annotated[List, add_messages]
     question: str
+    answer_options: Optional[List[str]]
     difficulty: Optional[Literal["basic", "intermediate", "advanced"]]
     confidence: Optional[float]
     agents: List[Dict]
@@ -249,7 +250,7 @@ class AgentNode:
     def __init__(self, instruction: str, role: str, model_info: str):
         # Validate model_info
         valid_models = [
-            'gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17',
+            'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-lite-preview-06-17',
             'gpt-4o-mini', 'gpt-4.1-mini'
         ]
         if model_info not in valid_models:

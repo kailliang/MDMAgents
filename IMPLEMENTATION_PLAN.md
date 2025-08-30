@@ -33,7 +33,6 @@ This document outlines the comprehensive plan for rewriting the MDMAgents system
 - **Hierarchical Orchestration**: Supervisor pattern for coordinating specialized agents
 - **Command-Based Control**: Use LangGraph's Command objects for dynamic routing
 - **Memory Management**: Leverage checkpointing for conversation state persistence
-- **⚠️ NON-MODIFICATION CONSTRAINT**: **DO NOT modify main.py and utils.py** - create new files for implementing LangGraph
 
 ### Proposed Graph Structure
 

@@ -31,8 +31,9 @@ This is a research implementation of "MDAgents: An Adaptive Collaboration of LLM
 
 ### Environment Management Rules
 **CRITICAL REMINDER**: 
-- **Virtual Environment**: Conda-managed Python 3.12.11 environment
-- **Direct Usage**: `venv/bin/python main.py` (recommended approach)
+- **Virtual Environment**: `conda activate ./venv`
+- **Direct Usage**: `venv/bin/python main.py` 
+- **Customised Usage**: `python3 main.py --dataset medqa --model gemini-2.5-flash --difficulty adaptive --num_samples 1`
 - **All Dependencies**: LangGraph 0.6.6, google-generativeai 0.8.5, python-dotenv installed
 
 ### Quick Start
@@ -43,11 +44,9 @@ This is a research implementation of "MDAgents: An Adaptive Collaboration of LLM
 ### Running the LangGraph System
 **Production Usage**:
 ```bash
-# LangGraph-based system (recommended)
+# LangGraph-based system 
 venv/bin/python main.py --dataset medqa --model gemini-2.5-flash --difficulty adaptive --num_samples 1
 
-# Original system (preserved)  
-venv/bin/python old_main.py --dataset medqa --model gemini-2.5-flash --difficulty adaptive --num_samples 1
 ```
 
 Available models:
@@ -176,20 +175,6 @@ def extract_final_answer_or_answer(text):
 - **Production-Ready Output**: Debug controls provide clean output for production vs verbose for development
 
 ## LangGraph Implementation Status
-
-### 🎯 **All 6 Stages Complete**
-- **Stage 1-2**: ✅ Core infrastructure with difficulty assessment & routing 
-- **Stage 3**: ✅ Basic processing with 3-expert + arbitrator system
-- **Stage 4**: ✅ Intermediate processing with multi-round debate
-- **Stage 5**: ✅ Advanced processing with MDT approach  
-- **Stage 6**: ✅ Production integration with monitoring & error recovery
-
-### 🚀 **Production Ready Features**
-- **Real LLM Integration**: Actual Gemini API calls with professional medical responses
-- **Comprehensive Testing**: 88 tests passing across all stages and components
-- **Performance Monitoring**: Real-time token tracking, health checks, and system metrics
-- **Error Recovery**: Exponential backoff retry logic with graceful degradation
-- **Production Entry Point**: Complete CLI compatibility with existing evaluation scripts
 
 ### 🏆 **Key Achievements**
 - **Complete Rewrite**: Original system preserved, LangGraph system fully operational

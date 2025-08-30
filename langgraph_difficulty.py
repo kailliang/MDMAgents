@@ -54,7 +54,7 @@ Provide your assessment in the following JSON format:
         if self._agent is None:
             # Validate model before creating agent
             valid_models = [
-                'gemini-2.5-flash', 'gemini-2.5-flash-lite-preview-06-17',
+                'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-lite-preview-06-17',
                 'gpt-4o-mini', 'gpt-4.1-mini'
             ]
             if self.model_info not in valid_models:
@@ -94,7 +94,14 @@ Provide your assessment in the following JSON format:
             "output_tokens": usage_after["output_tokens"] - usage_before["output_tokens"]
         }
         
-        logger.info(f"Difficulty assessment completed - Tokens used: {token_usage}")
+        # Parse the response to extract difficulty and confidence for logging
+        try:
+            difficulty, confidence = self._parse_response(response)
+            logger.info(f"Difficulty assessment completed - Level: {difficulty} (confidence: {confidence:.2f}) - Tokens used: {token_usage}")
+        except Exception as e:
+            logger.info(f"Difficulty assessment completed - Tokens used: {token_usage}")
+            logger.debug(f"Could not parse difficulty for logging: {e}")
+        
         logger.debug(f"Raw LLM response: {response}")
         
         return response, token_usage
@@ -215,7 +222,7 @@ def difficulty_router(state: MDMStateDict) -> Literal["basic_processing", "inter
     confidence = state.get("confidence", 0.0)
     
     # If confidence is too low, route to intermediate (safe default)
-    if confidence < 0.5:
+    if confidence < 0.3:
         return "intermediate_processing"
     
     # Route based on assessed difficulty

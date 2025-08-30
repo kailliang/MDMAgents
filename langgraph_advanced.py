@@ -15,6 +15,7 @@ Based on existing process_advanced_query function in utils.py:1108+
 
 import json
 import re
+import asyncio
 from typing import Dict, List, Any, Optional, TypedDict
 from langgraph.graph import StateGraph
 from langgraph.types import Command
@@ -26,6 +27,7 @@ class AdvancedProcessingState(TypedDict, total=False):
     # Core fields
     messages: List[Any]
     question: str
+    answer_options: Optional[List[str]]
     token_usage: Dict[str, int]
     processing_stage: str
     final_decision: Optional[Dict]
@@ -353,7 +355,11 @@ class OverallCoordinatorNode:
     def coordinate_decision(self, state: AdvancedProcessingState) -> Command:
         """Coordinate final decision from all MDT assessments"""
         question = state["question"]
+        answer_options = state.get("answer_options", [])
         compiled_report = state.get("compiled_report", "No report available")
+        
+        # Format answer options for display
+        options_text = "\n".join(answer_options) if answer_options else "No options provided"
         
         coordinator_prompt = f"""You are a medical coordinator. Review the following MDT investigations and provide your final decision in JSON format:
 
@@ -362,6 +368,9 @@ Combined MDT Assessments:
 
 Question: {question}
 
+**Answer Options:**
+{options_text}
+
 Analyze all MDT assessments and provide your final decision in exactly this JSON format:
 
 {{
@@ -369,7 +378,7 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
   "final_answer": "X) Example Answer"
 }}
 
-Requirements:
+**Requirements:**
 - Consider all MDT assessments
 - Final answer must correspond to one of the provided options
 - Return ONLY the JSON, no other text
@@ -429,6 +438,222 @@ Requirements:
                 return f"{match.group(1)}) Coordinator decision"
         
         return "X) Unable to extract answer"
+
+
+# Async helper functions for real team interactions
+
+async def process_team_internal_async(team: Dict, question: str, model_info: str) -> Dict[str, Any]:
+    """Process a single team's internal discussion with authentic 4 LLM call MDT pattern"""
+    team_name = team.get("team_name", "Medical Team")
+    members = team.get("members", [])
+    
+    # Identify lead member and assistants
+    lead_member = identify_lead_member(members)
+    assist_members = [m for m in members if m != lead_member]
+    
+    # Create lead agent
+    lead_role = lead_member.get("role", "team lead")
+    lead_agent = LangGraphAgent(
+        instruction=f"You are a {lead_role} leading a medical team discussion.",
+        role=lead_role.lower(),
+        model_info=model_info
+    )
+    
+    # STEP 1: Lead coordination call (50 words) - Following old_utils.py:294-301
+    delivery_prompt = f"""You are the lead of the medical group which aims to {team_name}. You have the following assistant clinicians who work for you:"""
+    if assist_members:
+        for a_mem in assist_members:
+            delivery_prompt += f"\n{a_mem.get('role', 'Assistant')}"
+    else:
+        delivery_prompt += "\nYou are working independently or with a predefined protocol to address the goal."
+    
+    delivery_prompt += f"\n\nNow, given the medical query, provide a short answer to what kind investigations are needed from each assistant clinicians (if any), or outline your approach. Strictly limit your response with no more than 50 words. \n Question: {question}"
+    
+    lead_delivery = lead_agent.chat(delivery_prompt)
+    lead_delivery_usage = lead_agent.get_token_usage()
+    
+    # STEP 2: Parallel assistant investigations (100 words each) - Following old_utils.py:318-320
+    investigations = []
+    if assist_members:
+        investigations = await gather_member_investigations_async(
+            assist_members, lead_delivery, team_name, question, model_info
+        )
+    
+    # STEP 3: Compile investigations - Following old_utils.py:322-327
+    gathered_investigation = ""
+    if investigations:
+        for investigation_item in investigations:
+            if len(investigation_item) >= 2:
+                role, investigation = investigation_item[0], investigation_item[1]
+                gathered_investigation += f"[{role}]\n{investigation}\n"
+    else:
+        gathered_investigation = lead_delivery
+    
+    # STEP 4: Lead final synthesis (100 words) - Following old_utils.py:330-332
+    investigation_prompt = f"""The gathered investigation from your assistant clinicians (or your own initial assessment if working alone) is as follows:
+{gathered_investigation}
+
+Now, return your answer to the medical query among the option provided. Limit your response with no more than 100 words.
+
+Question: {question}"""
+    
+    team_assessment = lead_agent.chat(investigation_prompt)
+    lead_synthesis_usage = lead_agent.get_token_usage()
+    
+    # Calculate total token usage for this team (lead + assistants)
+    total_tokens = {
+        "input_tokens": lead_delivery_usage["input_tokens"] + lead_synthesis_usage["input_tokens"],
+        "output_tokens": lead_delivery_usage["output_tokens"] + lead_synthesis_usage["output_tokens"]
+    }
+    
+    # Add assistant token usage
+    for investigation_item in investigations:
+        if len(investigation_item) >= 3:  # (role, investigation, usage)
+            _, _, assistant_usage = investigation_item
+            total_tokens["input_tokens"] += assistant_usage["input_tokens"]
+            total_tokens["output_tokens"] += assistant_usage["output_tokens"]
+    
+    return {
+        "team_name": team_name,
+        "assessment": team_assessment,
+        "token_usage": total_tokens,
+        "lead_delivery": lead_delivery,
+        "investigations": investigations,
+        "gathered_investigation": gathered_investigation
+    }
+
+
+async def gather_member_investigations_async(members: List[Dict], lead_delivery: str, 
+                                           team_goal: str, question: str, model_info: str) -> List[tuple]:
+    """Gather investigations from assistant members in parallel - Following old_utils.py:318-320"""
+    
+    async def get_member_investigation(member: Dict):
+        role = member.get("role", "team member")
+        expertise = member.get("expertise_description", "medical expertise")
+        
+        # Create member agent
+        member_agent = LangGraphAgent(
+            instruction=f"You are a {role} who {expertise.lower()}.",
+            role=role.lower(),
+            model_info=model_info
+        )
+        
+        # Exact prompt pattern from old_utils.py:319
+        investigation_prompt = f"""You are in a medical group where the goal is to {team_goal}. Your group lead is asking for the following investigations:
+{lead_delivery}
+
+Please remind your expertise and return your investigation summary that contains the core information. Strictly limit your response with no more than 100 words."""
+        
+        investigation = member_agent.chat(investigation_prompt)
+        usage = member_agent.get_token_usage()
+        
+        return (role, investigation, usage)
+    
+    # Process all members in parallel
+    tasks = [get_member_investigation(member) for member in members]
+    return await asyncio.gather(*tasks)
+
+
+def parallel_team_processing_sync(state: AdvancedProcessingState) -> Dict[str, Any]:
+    """Sync wrapper for parallel team processing with real LLM calls"""
+    
+    teams = state.get("mdt_teams", [])
+    question = state["question"]
+    model_info = getattr(state, '_model_info', 'gemini-2.5-flash')
+    
+    # Process all teams in parallel (now that each team is just 1 LLM call)
+    assessments = {
+        "initial": [],
+        "specialist": [],
+        "final_review": []
+    }
+    
+    total_token_usage = {"input_tokens": 0, "output_tokens": 0}
+    
+    # Use the parallel pattern from basic processing
+    import asyncio
+    
+    async def _process_all_teams_async():
+        team_tasks = [
+            process_team_internal_async(team, question, model_info)
+            for team in teams
+        ]
+        return await asyncio.gather(*team_tasks)
+    
+    def run_parallel_teams():
+        return asyncio.run(_process_all_teams_async())
+    
+    try:
+        team_results = run_parallel_teams()
+    except RuntimeError:
+        # Handle existing event loop
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, _process_all_teams_async())
+            team_results = future.result()
+    except Exception as e:
+        print(f"Warning: Parallel processing failed, falling back to sequential: {e}")
+        # Fallback to sequential processing
+        team_results = []
+        for team in teams:
+            try:
+                def run_single_team():
+                    return asyncio.run(process_team_internal_async(team, question, model_info))
+                
+                try:
+                    result = run_single_team()
+                    team_results.append(result)
+                except RuntimeError:
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, process_team_internal_async(team, question, model_info))
+                        team_results.append(future.result())
+            except Exception as team_error:
+                print(f"Warning: Team {team.get('team_name', 'Unknown')} failed: {team_error}")
+                team_results.append({
+                    "team_name": team.get("team_name", "Error Team"),
+                    "assessment": f"Processing error: {str(team_error)}",
+                    "token_usage": {"input_tokens": 0, "output_tokens": 0}
+                })
+    
+    # Process results
+    for result in team_results:
+        team_name = result["team_name"].lower()
+        assessment_data = {
+            "team_name": result["team_name"],
+            "assessment": result["assessment"]
+        }
+        
+        # Track token usage
+        usage = result["token_usage"]
+        total_token_usage["input_tokens"] += usage["input_tokens"]
+        total_token_usage["output_tokens"] += usage["output_tokens"]
+        
+        # Categorize by team type
+        if "initial" in team_name or "iat" in team_name:
+            assessments["initial"].append(assessment_data)
+        elif "final" in team_name or "review" in team_name or "frdt" in team_name:
+            assessments["final_review"].append(assessment_data)
+        else:
+            assessments["specialist"].append(assessment_data)
+    
+    # Compile report
+    compiled_report = compile_assessment_report(assessments)
+    
+    # Update state token usage
+    current_usage = state.get("token_usage", {"input": 0, "output": 0})
+    updated_usage = {
+        "input": current_usage["input"] + total_token_usage["input_tokens"],
+        "output": current_usage["output"] + total_token_usage["output_tokens"]
+    }
+    
+    return {
+        **state,
+        "team_assessments": assessments,
+        "compiled_report": compiled_report,
+        "token_usage": updated_usage,
+        "processing_stage": "teams_processed"
+    }
 
 
 # Utility functions
@@ -542,39 +767,10 @@ def create_advanced_processing_subgraph(model_info: str = "gemini-2.5-flash") ->
         }
     
     def parallel_team_processing(state: AdvancedProcessingState) -> Dict[str, Any]:
-        """Process all teams and generate assessments"""
-        teams = state.get("mdt_teams", [])
-        
-        # Simplified processing - generate mock assessments
-        assessments = {
-            "initial": [],
-            "specialist": [],
-            "final_review": []
-        }
-        
-        for team in teams:
-            team_name = team.get("team_name", "Unknown Team").lower()
-            assessment = {
-                "team_name": team.get("team_name", "Unknown Team"),
-                "assessment": f"Team assessment from {team.get('team_name', 'team')}"
-            }
-            
-            if "initial" in team_name or "iat" in team_name:
-                assessments["initial"].append(assessment)
-            elif "final" in team_name or "review" in team_name or "frdt" in team_name:
-                assessments["final_review"].append(assessment)
-            else:
-                assessments["specialist"].append(assessment)
-        
-        # Compile report
-        compiled_report = compile_assessment_report(assessments)
-        
-        return {
-            **state,
-            "team_assessments": assessments,
-            "compiled_report": compiled_report,
-            "processing_stage": "teams_processed"
-        }
+        """Process all teams with real LLM interactions"""
+        # Add model_info to state for the sync function
+        state_with_model = {**state, '_model_info': model_info}
+        return parallel_team_processing_sync(state_with_model)
     
     # Add nodes to subgraph
     subgraph.add_node("form_teams", formation.form_teams)

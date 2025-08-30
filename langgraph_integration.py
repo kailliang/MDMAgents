@@ -423,10 +423,7 @@ class PerformanceMonitor:
         return {
             "session_duration": total_session_time,
             "operation_times": avg_operation_times,
-            "token_usage_by_mode": self.token_usage_by_mode,
-            "total_token_usage": total_tokens,
             "health_summary": health_summary,
-            "health_checks": self.health_checks[-10:],  # Last 10 checks
             "timestamp": time.time()
         }
 
@@ -454,12 +451,12 @@ class IntegratedMDMSystem:
         logger.info(f"IntegratedMDMSystem initialized with model: {model_info}")
     
     async def process_question(self, question: str, options: List[str] = None,
-                             ground_truth: str = None) -> Dict[str, Any]:
+                             ground_truth: str = None, forced_difficulty: str = None) -> Dict[str, Any]:
         """Process a single question through the integrated system"""
         
-        logger.info(f"=== PROCESSING QUESTION ===")
-        logger.info(f"Question: {question[:100]}...")
-        logger.info(f"Model: {self.model_info}")
+        logger.debug(f"=== PROCESSING QUESTION ===")
+        logger.debug(f"Question: {question[:100]}...")
+        logger.debug(f"Model: {self.model_info}")
         
         operation_start = self.monitor.start_operation("process_question")
         
@@ -468,30 +465,62 @@ class IntegratedMDMSystem:
             initial_state = {
                 "messages": [],
                 "question": question,
+                "answer_options": options,
                 "agents": [],
                 "token_usage": {"input": 0, "output": 0},
                 "processing_stage": "start",
                 "final_decision": None
             }
             
-            logger.info("Starting LangGraph processing pipeline...")
+            # Handle forced difficulty routing
+            if forced_difficulty and forced_difficulty != "adaptive":
+                logger.info(f"Forcing {forced_difficulty} processing mode (skipping difficulty assessment)")
+                initial_state["difficulty"] = forced_difficulty
+                initial_state["confidence"] = 1.0  # High confidence since user specified
+                # We'll handle the routing by directly invoking the specific subgraph
+            
+            logger.debug("Starting LangGraph processing pipeline...")
             
             # Process through graph with error recovery
             @self.error_recovery.with_retry("graph_processing")
             def process_with_graph():
-                logger.info("Invoking compiled LangGraph...")
-                result = self.compiled_graph.invoke(initial_state)
-                logger.info(f"LangGraph processing completed. Final stage: {result.get('processing_stage', 'unknown')}")
-                return result
+                if forced_difficulty and forced_difficulty != "adaptive":
+                    # Direct processing without full graph
+                    logger.debug(f"Invoking {forced_difficulty} subgraph directly...")
+                    
+                    # Import specific subgraph
+                    if forced_difficulty == "basic":
+                        from langgraph_basic import create_basic_processing_subgraph
+                        subgraph = create_basic_processing_subgraph(self.model_info).compile()
+                    elif forced_difficulty == "intermediate":
+                        from langgraph_intermediate import create_intermediate_processing_subgraph
+                        subgraph = create_intermediate_processing_subgraph(self.model_info).compile()
+                    elif forced_difficulty == "advanced":
+                        from langgraph_advanced import create_advanced_processing_subgraph
+                        subgraph = create_advanced_processing_subgraph(self.model_info).compile()
+                    else:
+                        raise ValueError(f"Unknown forced difficulty: {forced_difficulty}")
+                    
+                    # Execute the specific subgraph
+                    result = subgraph.invoke(initial_state)
+                    result["processing_stage"] = f"{forced_difficulty}_complete"
+                    logger.debug(f"Forced {forced_difficulty} processing completed")
+                    return result
+                else:
+                    # Normal adaptive processing through full graph
+                    logger.debug("Invoking compiled LangGraph...")
+                    result = self.compiled_graph.invoke(initial_state)
+                    logger.debug(f"LangGraph processing completed. Final stage: {result.get('processing_stage', 'unknown')}")
+                    return result
             
             # Execute processing
             processing_start = time.time()
             result_state = process_with_graph()
             processing_time = time.time() - processing_start
             
-            logger.info(f"Total processing time: {processing_time:.3f} seconds")
-            logger.info(f"Final difficulty: {result_state.get('difficulty', 'unknown')}")
-            logger.info(f"Token usage: {result_state.get('token_usage', {})}")
+            logger.debug(f"Total processing time: {processing_time:.3f} seconds")
+            logger.debug(f"Final difficulty: {result_state.get('difficulty', 'unknown')}")
+            logger.debug(f"Token usage: {result_state.get('token_usage', {})}")
             
             # Synthesize result
             synthesized_result = self.synthesizer.synthesize_result(result_state, processing_time)
