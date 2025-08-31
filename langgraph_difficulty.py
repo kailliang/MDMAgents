@@ -223,7 +223,7 @@ def difficulty_router(state: MDMStateDict) -> Literal["basic_processing", "inter
     
     # If confidence is too low, route to intermediate (safe default)
     if confidence < 0.3:
-        return "intermediate_processing"
+        return "advanced_processing"
     
     # Route based on assessed difficulty
     if difficulty == "basic":

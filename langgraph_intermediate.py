@@ -67,6 +67,10 @@ class HierarchicalExpertRecruitmentNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
@@ -184,6 +188,10 @@ class DebateParticipationNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
@@ -282,6 +290,10 @@ class ExpertSelectionNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
@@ -365,6 +377,10 @@ class ExpertCommunicationNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
@@ -519,6 +535,10 @@ class ModeratorConsensusNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]

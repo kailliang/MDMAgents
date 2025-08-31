@@ -2,8 +2,8 @@ import json
 import re
 import csv
 
-input_filename = 'output/flash_lite_med_ada_332_smpl.json'
-output_filename = 'evaluation/flash_lite_med_ada_332_smpl.csv'
+input_filename = 'output/flash_lite_med_bas_10_smpl.json'
+output_filename = 'evaluation/flash_lite_med_bas_10_smpl.csv'
 
 with open(input_filename, 'r', encoding='utf-8') as f:
     raw_data = json.load(f)
@@ -15,7 +15,6 @@ elif isinstance(raw_data, list):
     data = raw_data
 else:
     raise ValueError("Unexpected JSON structure")
-
 def extract_final_answer_or_answer(text):
     # Handle parse error cases first
     if 'Parse error' in text:

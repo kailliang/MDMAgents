@@ -17,6 +17,7 @@ import os
 from typing import Dict, List, Any, Optional
 from langgraph.graph import StateGraph
 from langgraph.types import Command, Send
+from langgraph.func import task
 from langgraph_mdm import LangGraphAgent, MDMStateDict
 
 
@@ -42,10 +43,69 @@ class ExpertRecruitmentNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
         }
+    
+    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3, 
+                            required_fields: List[str] = None) -> tuple[str, Dict[str, int]]:
+        """Call LLM with retry on parse failures"""
+        total_usage = {"input_tokens": 0, "output_tokens": 0}
+        
+        for attempt in range(max_attempts):
+            # Add emphasis on JSON format for retries
+            if attempt > 0:
+                prompt = prompt.replace(
+                    "JSON format:", 
+                    "STRICT JSON format (return ONLY valid JSON, no other text):"
+                )
+                prompt = prompt.replace(
+                    "Return ONLY the JSON",
+                    "Return ONLY the JSON object. Do not include any text before or after the JSON."
+                )
+            
+            response, usage = self._call_llm(prompt)
+            total_usage["input_tokens"] += usage["input_tokens"]
+            total_usage["output_tokens"] += usage["output_tokens"]
+            
+            # Validate JSON response if we have required fields
+            if required_fields:
+                if self._validate_json_response(response, required_fields):
+                    return response, total_usage
+            else:
+                # Just check if it's valid JSON
+                try:
+                    cleaned = self._clean_json_response(response)
+                    json.loads(cleaned)
+                    return response, total_usage
+                except:
+                    pass
+        
+        # Return last attempt
+        return response, total_usage
+    
+    def _validate_json_response(self, response: str, required_fields: List[str]) -> bool:
+        """Validate if response contains valid JSON with required fields"""
+        try:
+            cleaned = self._clean_json_response(response)
+            parsed = json.loads(cleaned)
+            return all(field in parsed for field in required_fields)
+        except:
+            return False
+    
+    def _clean_json_response(self, response: str) -> str:
+        """Clean response to extract JSON"""
+        # Remove markdown code blocks
+        if '```json' in response:
+            response = response.split('```json')[1].split('```')[0]
+        elif '```' in response:
+            response = response.split('```')[1].split('```')[0]
+        return response.strip()
     
     def recruit_experts(self, state: MDMStateDict) -> Command:
         """Recruit 3 independent medical experts for the question"""
@@ -90,7 +150,11 @@ Please return your recruitment plan in JSON format:
 
 All experts should be marked as "Independent" with equal authority. Return ONLY the JSON, no other text."""
         
-        response, token_usage = self._call_llm(recruitment_prompt)
+        response, token_usage = self._call_llm_with_retry(
+            recruitment_prompt, 
+            max_attempts=3,
+            required_fields=["experts"]
+        )
         
         # Parse JSON response for expert recruitment
         try:
@@ -157,10 +221,69 @@ class ExpertAnalysisNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
         }
+    
+    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3, 
+                            required_fields: List[str] = None) -> tuple[str, Dict[str, int]]:
+        """Call LLM with retry on parse failures"""
+        total_usage = {"input_tokens": 0, "output_tokens": 0}
+        
+        for attempt in range(max_attempts):
+            # Add emphasis on JSON format for retries
+            if attempt > 0:
+                prompt = prompt.replace(
+                    "JSON format:", 
+                    "STRICT JSON format (return ONLY valid JSON, no other text):"
+                )
+                prompt = prompt.replace(
+                    "Return ONLY the JSON",
+                    "Return ONLY the JSON object. Do not include any text before or after the JSON."
+                )
+            
+            response, usage = self._call_llm(prompt)
+            total_usage["input_tokens"] += usage["input_tokens"]
+            total_usage["output_tokens"] += usage["output_tokens"]
+            
+            # Validate JSON response if we have required fields
+            if required_fields:
+                if self._validate_json_response(response, required_fields):
+                    return response, total_usage
+            else:
+                # Just check if it's valid JSON
+                try:
+                    cleaned = self._clean_json_response(response)
+                    json.loads(cleaned)
+                    return response, total_usage
+                except:
+                    pass
+        
+        # Return last attempt
+        return response, total_usage
+    
+    def _validate_json_response(self, response: str, required_fields: List[str]) -> bool:
+        """Validate if response contains valid JSON with required fields"""
+        try:
+            cleaned = self._clean_json_response(response)
+            parsed = json.loads(cleaned)
+            return all(field in parsed for field in required_fields)
+        except:
+            return False
+    
+    def _clean_json_response(self, response: str) -> str:
+        """Clean response to extract JSON"""
+        # Remove markdown code blocks
+        if '```json' in response:
+            response = response.split('```json')[1].split('```')[0]
+        elif '```' in response:
+            response = response.split('```')[1].split('```')[0]
+        return response.strip()
     
     def analyze_question(self, state: MDMStateDict) -> Command:
         """Analyze the medical question and provide structured JSON response"""
@@ -188,35 +311,53 @@ class ExpertAnalysisNode:
 - Return ONLY the JSON, no other text
 """
         
-        response, token_usage = self._call_llm(expert_prompt)
+        response, token_usage = self._call_llm_with_retry(
+            expert_prompt,
+            max_attempts=3,
+            required_fields=["reasoning", "answer"]
+        )
         
-        # Parse expert response with multi-layer fallback
+        # Parse expert response with improved multi-layer fallback
+        expert_response = None
+        
         try:
-            # Try JSON parsing first
-            json_match = re.search(r'\{[^{}]*"reasoning"\s*:[^{}]*"answer"\s*:\s*"[^"]*"[^{}]*\}', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                parsed_json = json.loads(json_str)
+            # First try direct JSON parsing with cleanup
+            cleaned = self._clean_json_response(response)
+            parsed_json = json.loads(cleaned)
+            if "reasoning" in parsed_json and "answer" in parsed_json:
                 expert_response = {
                     "expert_id": expert['id'],
                     "role": expert['role'],
                     "reasoning": parsed_json.get("reasoning", "").strip(),
                     "answer": parsed_json.get("answer", "").strip()
                 }
-            else:
-                # Fallback - extract from text
-                expert_response = {
-                    "expert_id": expert['id'],
-                    "role": expert['role'],
-                    "reasoning": response[:300] if len(response) > 0 else "Unable to parse expert response",
-                    "answer": self._extract_answer_from_text(response)
-                }
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        # If direct parsing failed, try regex extraction
+        if not expert_response:
+            try:
+                # More flexible regex that handles nested JSON
+                json_match = re.search(r'\{.*?"reasoning"\s*:\s*"(.*?)".*?"answer"\s*:\s*"([^"]*)".*?\}', response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                    parsed_json = json.loads(json_str)
+                    expert_response = {
+                        "expert_id": expert['id'],
+                        "role": expert['role'],
+                        "reasoning": parsed_json.get("reasoning", "").strip(),
+                        "answer": parsed_json.get("answer", "").strip()
+                    }
+            except:
+                pass
+        
+        # Final fallback - extract from text
+        if not expert_response:
             expert_response = {
                 "expert_id": expert['id'],
                 "role": expert['role'],
-                "reasoning": "JSON parsing error",
-                "answer": "X) JSON error"
+                "reasoning": response[:300] if len(response) > 0 else "Unable to parse expert response",
+                "answer": self._extract_answer_from_text(response)
             }
         
         # Update token usage and expert responses
@@ -310,10 +451,69 @@ class ArbitratorNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
         }
+    
+    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3, 
+                            required_fields: List[str] = None) -> tuple[str, Dict[str, int]]:
+        """Call LLM with retry on parse failures"""
+        total_usage = {"input_tokens": 0, "output_tokens": 0}
+        
+        for attempt in range(max_attempts):
+            # Add emphasis on JSON format for retries
+            if attempt > 0:
+                prompt = prompt.replace(
+                    "JSON format:", 
+                    "STRICT JSON format (return ONLY valid JSON, no other text):"
+                )
+                prompt = prompt.replace(
+                    "Return ONLY the JSON",
+                    "Return ONLY the JSON object. Do not include any text before or after the JSON."
+                )
+            
+            response, usage = self._call_llm(prompt)
+            total_usage["input_tokens"] += usage["input_tokens"]
+            total_usage["output_tokens"] += usage["output_tokens"]
+            
+            # Validate JSON response if we have required fields
+            if required_fields:
+                if self._validate_json_response(response, required_fields):
+                    return response, total_usage
+            else:
+                # Just check if it's valid JSON
+                try:
+                    cleaned = self._clean_json_response(response)
+                    json.loads(cleaned)
+                    return response, total_usage
+                except:
+                    pass
+        
+        # Return last attempt
+        return response, total_usage
+    
+    def _validate_json_response(self, response: str, required_fields: List[str]) -> bool:
+        """Validate if response contains valid JSON with required fields"""
+        try:
+            cleaned = self._clean_json_response(response)
+            parsed = json.loads(cleaned)
+            return all(field in parsed for field in required_fields)
+        except:
+            return False
+    
+    def _clean_json_response(self, response: str) -> str:
+        """Clean response to extract JSON"""
+        # Remove markdown code blocks
+        if '```json' in response:
+            response = response.split('```json')[1].split('```')[0]
+        elif '```' in response:
+            response = response.split('```')[1].split('```')[0]
+        return response.strip()
     
     def make_final_decision(self, state: MDMStateDict) -> Command:
         """Synthesize expert opinions and make final decision"""
@@ -353,24 +553,58 @@ Analyze all expert opinions and provide your final decision in exactly this JSON
 - Return ONLY the JSON, no other text
 """
         
-        response, token_usage = self._call_llm(arbitrator_prompt)
+        response, token_usage = self._call_llm_with_retry(
+            arbitrator_prompt,
+            max_attempts=3,
+            required_fields=["analysis", "final_answer"]
+        )
         
-        # Parse arbitrator response with fallback
+        # Parse arbitrator response with improved fallback
+        final_decision_dict = None
+        
+        # Try direct JSON parsing first
         try:
-            json_match = re.search(r'\{[^{}]*"analysis"\s*:[^{}]*"final_answer"\s*:\s*"[^"]*"[^{}]*\}', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                final_decision_dict = json.loads(json_str)
-            else:
-                # Fallback - extract from text
+            cleaned = self._clean_json_response(response)
+            parsed = json.loads(cleaned)
+            
+            # Check if analysis contains nested JSON (the bug we found)
+            if "analysis" in parsed and isinstance(parsed["analysis"], str):
+                # Check if analysis itself is a JSON string
+                if parsed["analysis"].strip().startswith('{'):
+                    try:
+                        # Unwrap nested JSON
+                        nested = json.loads(parsed["analysis"])
+                        if "analysis" in nested and "final_answer" in nested:
+                            parsed = nested
+                    except:
+                        pass  # Keep original if unwrapping fails
+            
+            if "analysis" in parsed and "final_answer" in parsed:
                 final_decision_dict = {
-                    "analysis": response[:300] if len(response) > 0 else "Unable to parse arbitrator response",
-                    "final_answer": self._extract_answer_from_text(response)
+                    "analysis": parsed["analysis"],
+                    "final_answer": parsed["final_answer"]
                 }
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        # If direct parsing failed, try regex extraction
+        if not final_decision_dict:
+            try:
+                # More flexible regex that handles various formats
+                json_match = re.search(r'\{.*?"analysis"\s*:\s*"(.*?)".*?"final_answer"\s*:\s*"([^"]*)".*?\}', response, re.DOTALL)
+                if json_match:
+                    final_decision_dict = {
+                        "analysis": json_match.group(1),
+                        "final_answer": json_match.group(2)
+                    }
+            except:
+                pass
+        
+        # Final fallback - extract answer from text
+        if not final_decision_dict:
             final_decision_dict = {
-                "analysis": "JSON parsing error in arbitrator response", 
-                "final_answer": "X) JSON error"
+                "analysis": response[:300] if len(response) > 0 else "Unable to parse arbitrator response",
+                "final_answer": self._extract_answer_from_text(response)
             }
         
         # Update token usage
@@ -455,45 +689,29 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
             "processing_stage": "expert_analysis_complete"
         }
     
-    # Create a parallel expert processing function using async pattern
-    def parallel_expert_processing(state: MDMStateDict) -> Dict[str, Any]:
-        """Process all experts in parallel using async pattern internally"""
-        import asyncio
-        
-        def run_parallel_analysis():
-            return asyncio.run(_parallel_expert_analysis_async(state))
-        
-        # Handle async execution within sync function
-        try:
-            return run_parallel_analysis()
-        except RuntimeError:
-            # Fallback to threaded execution if event loop is running
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, _parallel_expert_analysis_async(state))
-                return future.result()
+    # Task for individual expert analysis using LangGraph's @task decorator
+    @task
+    def analyze_expert_task(expert: Dict[str, Any], state: MDMStateDict, model_info: str) -> Dict[str, Any]:
+        """Analyze a single expert using LangGraph task - runs in parallel automatically"""
+        expert_node = ExpertAnalysisNode(expert, model_info)
+        result = expert_node.analyze_question({**state, "current_expert": expert})
+        return result.update
     
-    async def _parallel_expert_analysis_async(state: MDMStateDict) -> Dict[str, Any]:
-        """Async helper for parallel expert analysis"""
+    # Parallel expert processing using LangGraph task pattern
+    def parallel_expert_processing(state: MDMStateDict) -> Dict[str, Any]:
+        """Process all experts in parallel using LangGraph @task pattern"""
         experts = state.get("experts", [])
         if not experts:
             return {**state, "expert_responses": [], "processing_stage": "no_experts"}
         
-        # Create async tasks for each expert
-        async def analyze_expert_async(expert):
-            def sync_analysis():
-                expert_node = ExpertAnalysisNode(expert, model_info)
-                result = expert_node.analyze_question({**state, "current_expert": expert})
-                return result.update
-            
-            return await asyncio.to_thread(sync_analysis)
-        
-        # Run all expert analyses in parallel
         try:
-            expert_tasks = [analyze_expert_async(expert) for expert in experts]
-            results = await asyncio.gather(*expert_tasks)
+            # Create tasks for all experts - LangGraph handles parallelization
+            tasks = [analyze_expert_task(expert, state, model_info) for expert in experts]
             
-            # Collect all expert responses
+            # Collect results from all tasks
+            results = [task.result() for task in tasks]
+            
+            # Aggregate expert responses and token usage
             expert_responses = []
             total_token_usage = state.get("token_usage", {"input": 0, "output": 0})
             

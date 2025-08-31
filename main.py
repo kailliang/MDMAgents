@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -69,13 +70,9 @@ class DatasetLoader:
         elif isinstance(options, list):
             option_list = options
         
-        # Complete question with options
-        if option_list:
-            full_question = f"{question_text}\n\nOptions:\n" + "\n".join(option_list)
-        else:
-            full_question = question_text
-        
-        return full_question, option_list, answer_key
+        # Return question text without options (options passed separately)
+        # This prevents duplication when options are added in prompts
+        return question_text, option_list, answer_key
 
 
 class OutputManager:
@@ -151,6 +148,52 @@ class OutputManager:
             return False
 
 
+def extract_answer_letter(text: str) -> str:
+    """
+    Extract final answer letter (A, B, C, D, E) from model response.
+    Uses similar logic to evaluate_text_output.py for consistency.
+    """
+    if not text:
+        return 'X'  # Parse error marker
+    
+    # Convert to string if needed
+    text = str(text)
+    
+    # Pattern 1: "Answer: C" or "Final answer: C"
+    answer_match = re.search(r'\b(?:answer|final[_\s]answer|decision|conclusion):\s*([A-E])\b', text, re.IGNORECASE)
+    if answer_match:
+        return answer_match.group(1).upper()
+    
+    # Pattern 2: "A) Some option text" or "B) Option text"
+    option_match = re.search(r'\b([A-E])\)\s*[A-Z]', text)
+    if option_match:
+        return option_match.group(1).upper()
+    
+    # Pattern 3: "(A) Some text" format
+    paren_match = re.search(r'\(([A-E])\)', text)
+    if paren_match:
+        return paren_match.group(1).upper()
+    
+    # Pattern 4: Just the letter "A", "B", etc. (with word boundaries)
+    letter_match = re.search(r'\b([A-E])\b', text)
+    if letter_match:
+        return letter_match.group(1).upper()
+    
+    return 'X'  # Could not parse answer
+
+
+def check_answer_correctness(model_response: str, ground_truth: str) -> bool:
+    """Check if model response matches ground truth answer"""
+    extracted_answer = extract_answer_letter(model_response)
+    ground_truth_letter = ground_truth.upper() if ground_truth else ''
+    
+    # Handle parse error case
+    if extracted_answer == 'X':
+        return False
+        
+    return extracted_answer == ground_truth_letter
+
+
 async def process_dataset_async(system: IntegratedMDMSystem, dataset: List[Dict[str, Any]], 
                                num_samples: Optional[int] = None, difficulty_filter: str = "adaptive", verbose: bool = False) -> List[Dict[str, Any]]:
     """Process dataset questions asynchronously through the integrated system"""
@@ -162,6 +205,10 @@ async def process_dataset_async(system: IntegratedMDMSystem, dataset: List[Dict[
     
     results = []
     total_questions = len(dataset)
+    
+    # Initialize accuracy tracking
+    correct_count = 0
+    total_processed = 0
     
     for i, question_data in enumerate(dataset):
         # Clear separator for each sample
@@ -184,6 +231,33 @@ async def process_dataset_async(system: IntegratedMDMSystem, dataset: List[Dict[
             )
             
             results.append(result)
+            
+            # Log detailed per-question information
+            token_info = result.get("token_usage", {})
+            input_tokens = token_info.get("input", 0)
+            output_tokens = token_info.get("output", 0)
+            total_tokens = input_tokens + output_tokens
+            
+            # Log token usage
+            logger.info(f"Question {i+1}/{total_questions} | Tokens: {input_tokens} in, {output_tokens} out | Total: {total_tokens}")
+            
+            # Check answer correctness and update tracking
+            model_answer = result.get("model_response", "")
+            is_correct = check_answer_correctness(model_answer, ground_truth)
+            
+            if is_correct:
+                correct_count += 1
+            total_processed += 1
+            
+            # Calculate and log running accuracy
+            current_accuracy = (correct_count / total_processed) * 100
+            
+            # Log answer correctness with truncated response for readability
+            answer_preview = model_answer[:50] + "..." if len(model_answer) > 50 else model_answer
+            status_icon = "✓ CORRECT" if is_correct else "✗ WRONG"
+            
+            logger.info(f"Question {i+1}/{total_questions} | Answer: {answer_preview} | Expected: {ground_truth} | {status_icon}")
+            logger.info(f"Question {i+1}/{total_questions} | Running Accuracy: {current_accuracy:.1f}% ({correct_count}/{total_processed})")
             
             # Remove redundant progress logging - handled above
                 

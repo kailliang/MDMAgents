@@ -71,7 +71,6 @@ class LangGraphAgent:
     
     def chat(self, message):
         """Make real LLM API call"""
-        logger.info(f"LLM call initiated - Agent: {self.role}, Model: {self.model_info}")
         logger.debug(f"Input message length: {len(str(message))} characters")
         
         try:
@@ -157,6 +156,21 @@ class LangGraphAgent:
             "output_tokens": self.total_output_tokens, 
             "total_tokens": self.total_input_tokens + self.total_output_tokens
         }
+    
+    def clear_history(self):
+        """Clear conversation history to prevent accumulation across questions"""
+        logger.debug(f"Clearing conversation history for {self.role}")
+        
+        if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-lite-preview-06-17']:
+            # Reset Gemini chat session
+            self._chat = self.model.start_chat(history=[])
+        elif self.model_info in ['gpt-4o-mini', 'gpt-4.1-mini']:
+            # Reset OpenAI messages to system prompt only
+            self.messages = [
+                {"role": "system", "content": str(self.instruction)},
+            ]
+        
+        logger.debug(f"Conversation history cleared for {self.role}")
 
 # Use LangGraphAgent as Agent for this implementation
 Agent = LangGraphAgent

@@ -69,6 +69,10 @@ class MDTFormationNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
@@ -232,6 +236,10 @@ class TeamMemberNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
@@ -374,6 +382,10 @@ class OverallCoordinatorNode:
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
+        
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+        
         return response, {
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"]
@@ -511,6 +523,8 @@ Question: {question}"""
     
     lead_delivery = lead_agent.chat(delivery_prompt)
     lead_delivery_usage = lead_agent.get_token_usage()
+    # Clear history after each call to prevent accumulation
+    lead_agent.clear_history()
     
     # STEP 2: Assistant investigations (100 words each) - Following old_utils.py:318-320
     investigations = []
@@ -544,6 +558,8 @@ Based on the team investigations above, determine which option is most appropria
     
     team_assessment = lead_agent.chat(investigation_prompt)
     lead_synthesis_usage = lead_agent.get_token_usage()
+    # Clear history after final call to prevent accumulation
+    lead_agent.clear_history()
     
     # Calculate total token usage for this team (lead + assistants)
     total_tokens = {
@@ -601,6 +617,8 @@ Please remind your expertise and return your investigation summary that contains
         
         investigation = member_agent.chat(investigation_prompt)
         usage = member_agent.get_token_usage()
+        # Clear history after each member call to prevent accumulation
+        member_agent.clear_history()
         
         investigations.append((role, investigation, usage))
     
