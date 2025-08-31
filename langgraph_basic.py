@@ -50,9 +50,16 @@ class ExpertRecruitmentNode:
     def recruit_experts(self, state: MDMStateDict) -> Command:
         """Recruit 3 independent medical experts for the question"""
         question = state["question"]
+        answer_options = state.get("answer_options", [])
+        
+        # Format answer options
+        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
         
         num_experts_to_recruit = 3
         recruitment_prompt = f"""Question: {question}
+
+Answer Options:
+{options_text}
 
 You need to recruit {num_experts_to_recruit} medical experts with different specialties but equal authority/weight to analyze this question. 
 

@@ -75,9 +75,16 @@ class HierarchicalExpertRecruitmentNode:
     def recruit_experts(self, state: IntermediateProcessingState) -> Command:
         """Recruit 3 experts with hierarchical relationships"""
         question = state["question"]
+        answer_options = state.get("answer_options", [])
+        
+        # Format answer options
+        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
         
         recruitment_prompt = f"""
 Question: {question}
+
+Answer Options:
+{options_text}
 
 You need to recruit 3 medical experts with different specialties to discuss this question.
 You should specify hierarchical relationships between experts (e.g., "Cardiologist > Pulmonologist" means Cardiologist has higher authority).
@@ -366,13 +373,20 @@ class ExpertCommunicationNode:
     def generate_communication(self, state: IntermediateProcessingState) -> Command:
         """Generate communication from source to target expert"""
         question = state["question"]
+        answer_options = state.get("answer_options", [])
         target_role = self.target_expert.get("role", "colleague")
+        
+        # Format answer options
+        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
         
         comm_prompt = f"""Please provide your opinion/question for {target_role} regarding this medical case.
 
 Question: {question}
 
-Deliver your opinion to convince the other expert. Limit to 200 words."""
+Answer Options:
+{options_text}
+
+Deliver your opinion to convince the other expert. Focus on determining the correct answer from the options above. Limit to 200 words."""
         
         response, token_usage = self._call_llm(comm_prompt)
         
@@ -436,7 +450,11 @@ class RoundSynthesisNode:
         """Synthesize expert opinions after debate round"""
         experts = state.get("experts_hierarchy", [])
         question = state["question"]
+        answer_options = state.get("answer_options", [])
         round_num = state.get("round_number", 1)
+        
+        # Format answer options
+        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
         
         # Collect updated opinions from each expert
         next_round_opinions = {}
@@ -448,7 +466,10 @@ class RoundSynthesisNode:
             synthesis_prompt = f"""Reflecting on the discussions in Round {round_num}, what is your current opinion on:
 {question}
 
-Limit your answer to 50 words."""
+Answer Options:
+{options_text}
+
+Focus on determining the correct answer from the options above. Limit your answer to 50 words."""
             
             response, token_usage = self._call_llm(synthesis_prompt, role)
             next_round_opinions[role.lower()] = response
@@ -785,19 +806,25 @@ If you don't want to participate:
         return decision, token_usage
     
     async def generate_communication_async(source_expert: Dict, target_expert: Dict, 
-                                         question: str, model_info: str) -> tuple[str, Dict[str, int]]:
+                                         question: str, answer_options: List[str], model_info: str) -> tuple[str, Dict[str, int]]:
         """Generate communication from source expert to target expert"""
         participation_node = DebateParticipationNode(source_expert, model_info)
         
+        # Format answer options
+        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
+        
         comm_prompt = f"""Please remind your medical expertise and then leave your opinion/question for an expert you chose (Agent {target_expert['id']}. {target_expert['role']}). 
-You should deliver your opinion once you are confident enough and in a way to convince other expert. Limit your response with no more than 200 words.
+You should deliver your opinion once you are confident enough and in a way to convince other expert. Focus on determining the correct answer from the options below. Limit your response with no more than 200 words.
 
-Question: {question}"""
+Question: {question}
+
+Answer Options:
+{options_text}"""
         
         return await participation_node._call_llm_async(comm_prompt)
     
     async def collect_expert_opinion_async(expert: Dict, round_num: int, question: str, 
-                                         model_info: str) -> tuple[str, Dict[str, int]]:
+                                         answer_options: List[str], model_info: str) -> tuple[str, Dict[str, int]]:
         """Collect expert opinion after round discussions"""
         opinion_agent = LangGraphAgent(
             instruction=f"You are a {expert['role']} reflecting on the discussion.",
@@ -805,7 +832,10 @@ Question: {question}"""
             model_info=model_info
         )
         
-        opinion_prompt = f"Reflecting on the discussions in Round {round_num}, what is your current answer/opinion on the question: {question}\n Limit your answer within 50 words"
+        # Format answer options
+        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
+        
+        opinion_prompt = f"Reflecting on the discussions in Round {round_num}, what is your current answer/opinion on the question: {question}\n\nAnswer Options:\n{options_text}\n\nFocus on determining the correct answer from the options above. Limit your answer within 50 words"
         
         def sync_call():
             response = opinion_agent.chat(opinion_prompt)
@@ -818,7 +848,7 @@ Question: {question}"""
         return await asyncio.to_thread(sync_call)
     
     async def collect_final_opinion_async(expert: Dict, question: str, 
-                                        model_info: str) -> tuple[str, Dict[str, int]]:
+                                        answer_options: List[str], model_info: str) -> tuple[str, Dict[str, int]]:
         """Collect final expert opinion"""
         final_agent = LangGraphAgent(
             instruction=f"You are a {expert['role']} making final assessment.",
@@ -826,7 +856,10 @@ Question: {question}"""
             model_info=model_info
         )
         
-        final_prompt = f"Now that you've interacted with other medical experts, remind your expertise and the comments from other experts and make your final answer to the given question:\n{question}\n limit your answer within 50 words."
+        # Format answer options
+        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
+        
+        final_prompt = f"Now that you've interacted with other medical experts, remind your expertise and the comments from other experts and make your final answer to the given question:\n{question}\n\nAnswer Options:\n{options_text}\n\nFocus on determining the correct answer from the options above. Limit your answer within 50 words."
         
         def sync_call():
             response = final_agent.chat(final_prompt)
@@ -862,6 +895,8 @@ Question: {question}"""
         """Conduct multi-round debate with participation consent system - OPTIMIZED with parallel processing"""
         experts = state.get("experts_hierarchy", [])
         question = state["question"]
+        answer_options = state.get("answer_options", [])
+        model_info = getattr(state, '_model_info', 'gemini-2.5-flash')  # Get model info from state
         current_round = state.get("round_number", 1)
         max_rounds = 3
         
@@ -927,7 +962,7 @@ Question: {question}"""
                         if 1 <= target_id <= len(experts):
                             target_expert = next((e for e in experts if e["id"] == target_id), None)
                             if target_expert:
-                                task = generate_communication_async(expert, target_expert, question, model_info)
+                                task = generate_communication_async(expert, target_expert, question, answer_options, model_info)
                                 communication_tasks.append((expert, target_expert, task))
             
             # PARALLEL EXECUTION: Execute all communications at once
@@ -976,7 +1011,7 @@ Question: {question}"""
             # PARALLEL EXECUTION: Collect updated opinions for next round  
             if round_num < max_rounds:
                 opinion_tasks = [
-                    collect_expert_opinion_async(expert, round_num, question, model_info)
+                    collect_expert_opinion_async(expert, round_num, question, answer_options, model_info)
                     for expert in experts
                 ]
                 
@@ -997,7 +1032,7 @@ Question: {question}"""
                     # Fallback to sequential processing
                     next_round_opinions = {}
                     for expert in experts:
-                        opinion_response, usage = await collect_expert_opinion_async(expert, round_num, question, model_info)
+                        opinion_response, usage = await collect_expert_opinion_async(expert, round_num, question, answer_options, model_info)
                         total_tokens["input"] += usage["input_tokens"]
                         total_tokens["output"] += usage["output_tokens"]
                         next_round_opinions[expert['role'].lower()] = opinion_response
@@ -1005,7 +1040,7 @@ Question: {question}"""
         
         # PARALLEL EXECUTION: Collect final opinions from all experts
         final_opinion_tasks = [
-            collect_final_opinion_async(expert, question, model_info)
+            collect_final_opinion_async(expert, question, answer_options, model_info)
             for expert in experts
         ]
         
@@ -1024,7 +1059,7 @@ Question: {question}"""
             # Fallback to sequential processing
             final_opinions = {}
             for expert in experts:
-                final_response, usage = await collect_final_opinion_async(expert, question, model_info)
+                final_response, usage = await collect_final_opinion_async(expert, question, answer_options, model_info)
                 total_tokens["input"] += usage["input_tokens"]
                 total_tokens["output"] += usage["output_tokens"]
                 final_opinions[expert['role']] = final_response
