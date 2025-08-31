@@ -49,9 +49,8 @@ pdf/
 imgs/
 evaluation/
 output/
-claude-instructions.md
 *.md
-!README.mds
+!README.md
 old_utils.py
 old_main.py
 
