@@ -21,6 +21,7 @@ from typing import Dict, List, Any, Optional, TypedDict, Annotated
 from langgraph.graph import StateGraph
 from langgraph.types import Command
 from langgraph_mdm import LangGraphAgent
+from langsmith_integration import span as langsmith_span, preview_text
 
 
 class AdvancedProcessingState(TypedDict, total=False):
@@ -85,6 +86,7 @@ class MDTFormationNode:
         
         num_teams = 3
         num_members_per_team = 3
+        question_preview = preview_text(question)
         
         # Format answer options
         options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
@@ -128,37 +130,51 @@ You must include Initial Assessment Team (IAT) and Final Review and Decision Tea
 Each team should have exactly {num_members_per_team} members with one designated as Lead.
 Return only valid JSON without markdown code blocks."""
         
-        response, token_usage = self._call_llm(formation_prompt)
-        
-        # Parse MDT response
-        try:
-            # Clean JSON response
-            cleaned_response = self._clean_json_response(response)
-            mdt_data = json.loads(cleaned_response)
-            teams = mdt_data.get('teams', [])
-            
-            if len(teams) != num_teams:
-                raise ValueError(f"Expected {num_teams} teams, got {len(teams)}")
-                
-        except (json.JSONDecodeError, ValueError):
-            # Fallback to default teams
-            teams = self._create_default_teams()
-        
-        # Update token usage
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "mdt_teams": teams,
-                "token_usage": updated_usage,
-                "processing_stage": "teams_formed"
+        with langsmith_span(
+            "advanced.form_teams",
+            run_type="chain",
+            inputs={
+                "question_preview": question_preview,
+                "options_count": len(answer_options or []),
             },
-            goto="categorize_teams"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(formation_prompt)
+            
+            # Parse MDT response
+            try:
+                cleaned_response = self._clean_json_response(response)
+                mdt_data = json.loads(cleaned_response)
+                teams = mdt_data.get('teams', [])
+                
+                if len(teams) != num_teams:
+                    raise ValueError(f"Expected {num_teams} teams, got {len(teams)}")
+                    
+            except (json.JSONDecodeError, ValueError):
+                teams = self._create_default_teams()
+            
+            # Update token usage
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "teams": [team.get("team_name") for team in teams],
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "mdt_teams": teams,
+                    "token_usage": updated_usage,
+                    "processing_stage": "teams_formed"
+                },
+                goto="categorize_teams"
+            )
     
     def _clean_json_response(self, response: str) -> str:
         """Clean JSON response by removing markdown and extracting JSON"""
@@ -250,6 +266,7 @@ class TeamMemberNode:
         question = state["question"]
         answer_options = state.get("answer_options", [])
         role = self.member_info.get("role", "team member")
+        question_preview = preview_text(question)
         
         # Format answer options
         options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
@@ -265,22 +282,36 @@ Provide your professional opinion focusing on determining the correct answer fro
 
 **CRITICAL: Your response MUST be 150 words or less. Responses over 150 words will be rejected.**"""
         
-        response, token_usage = self._call_llm(assessment_prompt)
-        
-        # Update token usage
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "assessment": response,
-                "token_usage": updated_usage
+        with langsmith_span(
+            "advanced.member_assessment",
+            run_type="chain",
+            inputs={
+                "role": role,
+                "question_preview": question_preview,
             },
-            goto="continue_team_assessment"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(assessment_prompt)
+            
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "assessment": response,
+                    "token_usage": updated_usage
+                },
+                goto="continue_team_assessment"
+            )
 
 
 class TeamAssessmentNode:
@@ -318,6 +349,7 @@ class TeamAssessmentNode:
         question = state["question"]
         answer_options = state.get("answer_options", [])
         team_name = self.team.get("team_name", "Medical Team")
+        question_preview = preview_text(question)
         
         # Format team members
         members_text = ""
@@ -342,22 +374,36 @@ Conduct an internal team discussion and provide the team's consensus assessment.
 
 **CRITICAL: Your response MUST be 200 words or less. Responses over 200 words will be rejected.**"""
         
-        response, token_usage = self._call_llm(assessment_prompt)
-        
-        # Update token usage
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "team_assessment": response,
-                "token_usage": updated_usage
+        with langsmith_span(
+            "advanced.team_assessment",
+            run_type="chain",
+            inputs={
+                "team_name": team_name,
+                "question_preview": question_preview,
             },
-            goto="continue_parallel_processing"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(assessment_prompt)
+            
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "team_assessment": response,
+                    "token_usage": updated_usage
+                },
+                goto="continue_parallel_processing"
+            )
 
 
 class OverallCoordinatorNode:
@@ -396,6 +442,7 @@ class OverallCoordinatorNode:
         question = state["question"]
         answer_options = state.get("answer_options", [])
         compiled_report = state.get("compiled_report", "No report available")
+        question_preview = preview_text(question)
         
         # Format answer options for display
         options_text = "\n".join(answer_options) if answer_options else "No options provided"
@@ -424,43 +471,55 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
 - Return ONLY the JSON, no other text or explanations
 """
         
-        response, token_usage = self._call_llm(coordinator_prompt)
-        
-        # Parse coordinator response
-        try:
-            json_match = re.search(r'\{[^{}]*"analysis"\s*:[^{}]*"final_answer"\s*:\s*"[^"]*"[^{}]*\}', response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                coordinator_decision = json.loads(json_str)
-            else:
-                # Fallback - extract from text
-                coordinator_decision = {
-                    "analysis": response[:300] if response else "Unable to parse coordinator response",
-                    "final_answer": self._extract_answer_from_text(response)
-                }
-        except json.JSONDecodeError:
-            coordinator_decision = {
-                "analysis": "JSON parsing error in coordinator response",
-                "final_answer": "X) Parsing error",
-                "raw_response": response
-            }
-        
-        # Update token usage
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "coordinator_decision": coordinator_decision,
-                "final_decision": coordinator_decision,  # For compatibility
-                "token_usage": updated_usage,
-                "processing_stage": "advanced_complete"
+        with langsmith_span(
+            "advanced.coordinator_decision",
+            run_type="chain",
+            inputs={
+                "question_preview": question_preview,
             },
-            goto="advanced_complete"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(coordinator_prompt)
+            
+            try:
+                json_match = re.search(r'\{[^{}]*"analysis"\s*:[^{}]*"final_answer"\s*:\s*"[^"]*"[^{}]*\}', response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                    coordinator_decision = json.loads(json_str)
+                else:
+                    coordinator_decision = {
+                        "analysis": response[:300] if response else "Unable to parse coordinator response",
+                        "final_answer": self._extract_answer_from_text(response)
+                    }
+            except json.JSONDecodeError:
+                coordinator_decision = {
+                    "analysis": "JSON parsing error in coordinator response",
+                    "final_answer": "X) Parsing error",
+                    "raw_response": response
+                }
+            
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "final_answer": coordinator_decision.get("final_answer"),
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "coordinator_decision": coordinator_decision,
+                    "final_decision": coordinator_decision,
+                    "token_usage": updated_usage,
+                    "processing_stage": "advanced_complete"
+                },
+                goto="advanced_complete"
+            )
     
     def _extract_answer_from_text(self, text: str) -> str:
         """Extract answer from free text response"""
@@ -630,124 +689,229 @@ Please remind your expertise and return your investigation summary that contains
 def process_team_1(state: AdvancedProcessingState) -> Dict[str, Any]:
     """Process first team in parallel"""
     teams = state.get("mdt_teams", [])
-    if len(teams) < 1:
-        return {"team_results": [{"team_name": "Error Team 1", "assessment": "No team data", "token_usage": {"input_tokens": 0, "output_tokens": 0}}]}
-    
-    team = teams[0]
-    question = state["question"]
-    answer_options = state.get("answer_options", [])
-    model_info = getattr(state, '_model_info', 'gemini-2.5-flash')
-    
-    result = process_single_team(team, question, answer_options, model_info)
-    
-    # Format for reducer - wrap in list for concatenation
-    assessment_data = {
-        "team_name": result["team_name"],
-        "assessment": result["assessment"]
-    }
-    
-    # Return only this team's token usage - let reducer handle combining
-    return {
-        "team_results": [assessment_data],
-        "token_usage": {
-            "input": result["token_usage"]["input_tokens"],
-            "output": result["token_usage"]["output_tokens"]
+    team = teams[0] if len(teams) >= 1 else None
+
+    with langsmith_span(
+        "advanced.process_team",
+        run_type="chain",
+        inputs={
+            "team_index": 1,
+            "team_name": team.get("team_name") if team else None,
+        },
+    ) as (_, finish_span):
+        if team is None:
+            fallback = {
+                "team_results": [{
+                    "team_name": "Error Team 1",
+                    "assessment": "No team data",
+                    "token_usage": {"input_tokens": 0, "output_tokens": 0}
+                }]
+            }
+            finish_span(outputs={"fallback": True})
+            return fallback
+
+        question = state["question"]
+        answer_options = state.get("answer_options", [])
+        model_info = getattr(state, '_model_info', 'gemini-2.5-flash')
+
+        result = process_single_team(team, question, answer_options, model_info)
+
+        assessment_data = {
+            "team_name": result["team_name"],
+            "assessment": result["assessment"]
         }
-    }
+        formatted_result = {
+            "team_results": [assessment_data],
+            "token_usage": {
+                "input": result["token_usage"]["input_tokens"],
+                "output": result["token_usage"]["output_tokens"]
+            }
+        }
+
+        finish_span(
+            outputs={
+                "team_name": result["team_name"],
+                "token_usage": formatted_result["token_usage"],
+            },
+            usage={
+                "input_tokens": result["token_usage"].get("input_tokens", 0),
+                "output_tokens": result["token_usage"].get("output_tokens", 0),
+                "total_tokens": result["token_usage"].get("input_tokens", 0) + result["token_usage"].get("output_tokens", 0),
+            },
+        )
+
+        return formatted_result
 
 
 def process_team_2(state: AdvancedProcessingState) -> Dict[str, Any]:
     """Process second team in parallel"""
     teams = state.get("mdt_teams", [])
-    if len(teams) < 2:
-        return {"team_results": [{"team_name": "Error Team 2", "assessment": "No team data", "token_usage": {"input_tokens": 0, "output_tokens": 0}}]}
-    
-    team = teams[1]
-    question = state["question"]
-    answer_options = state.get("answer_options", [])
-    model_info = getattr(state, '_model_info', 'gemini-2.5-flash')
-    
-    result = process_single_team(team, question, answer_options, model_info)
-    
-    # Format for reducer - wrap in list for concatenation
-    assessment_data = {
-        "team_name": result["team_name"],
-        "assessment": result["assessment"]
-    }
-    
-    # Return only this team's token usage - let reducer handle combining
-    return {
-        "team_results": [assessment_data],
-        "token_usage": {
-            "input": result["token_usage"]["input_tokens"],
-            "output": result["token_usage"]["output_tokens"]
+    team = teams[1] if len(teams) >= 2 else None
+
+    with langsmith_span(
+        "advanced.process_team",
+        run_type="chain",
+        inputs={
+            "team_index": 2,
+            "team_name": team.get("team_name") if team else None,
+        },
+    ) as (_, finish_span):
+        if team is None:
+            fallback = {
+                "team_results": [{
+                    "team_name": "Error Team 2",
+                    "assessment": "No team data",
+                    "token_usage": {"input_tokens": 0, "output_tokens": 0}
+                }]
+            }
+            finish_span(outputs={"fallback": True})
+            return fallback
+
+        question = state["question"]
+        answer_options = state.get("answer_options", [])
+        model_info = getattr(state, '_model_info', 'gemini-2.5-flash')
+
+        result = process_single_team(team, question, answer_options, model_info)
+
+        assessment_data = {
+            "team_name": result["team_name"],
+            "assessment": result["assessment"]
         }
-    }
+        formatted_result = {
+            "team_results": [assessment_data],
+            "token_usage": {
+                "input": result["token_usage"]["input_tokens"],
+                "output": result["token_usage"]["output_tokens"]
+            }
+        }
+
+        finish_span(
+            outputs={
+                "team_name": result["team_name"],
+                "token_usage": formatted_result["token_usage"],
+            },
+            usage={
+                "input_tokens": result["token_usage"].get("input_tokens", 0),
+                "output_tokens": result["token_usage"].get("output_tokens", 0),
+                "total_tokens": result["token_usage"].get("input_tokens", 0) + result["token_usage"].get("output_tokens", 0),
+            },
+        )
+
+        return formatted_result
 
 
 def process_team_3(state: AdvancedProcessingState) -> Dict[str, Any]:
     """Process third team in parallel"""
     teams = state.get("mdt_teams", [])
-    if len(teams) < 3:
-        return {"team_results": [{"team_name": "Error Team 3", "assessment": "No team data", "token_usage": {"input_tokens": 0, "output_tokens": 0}}]}
-    
-    team = teams[2]
-    question = state["question"]
-    answer_options = state.get("answer_options", [])
-    model_info = getattr(state, '_model_info', 'gemini-2.5-flash')
-    
-    result = process_single_team(team, question, answer_options, model_info)
-    
-    # Format for reducer - wrap in list for concatenation
-    assessment_data = {
-        "team_name": result["team_name"],
-        "assessment": result["assessment"]
-    }
-    
-    # Return only this team's token usage - let reducer handle combining
-    return {
-        "team_results": [assessment_data],
-        "token_usage": {
-            "input": result["token_usage"]["input_tokens"],
-            "output": result["token_usage"]["output_tokens"]
+    team = teams[2] if len(teams) >= 3 else None
+
+    with langsmith_span(
+        "advanced.process_team",
+        run_type="chain",
+        inputs={
+            "team_index": 3,
+            "team_name": team.get("team_name") if team else None,
+        },
+    ) as (_, finish_span):
+        if team is None:
+            fallback = {
+                "team_results": [{
+                    "team_name": "Error Team 3",
+                    "assessment": "No team data",
+                    "token_usage": {"input_tokens": 0, "output_tokens": 0}
+                }]
+            }
+            finish_span(outputs={"fallback": True})
+            return fallback
+
+        question = state["question"]
+        answer_options = state.get("answer_options", [])
+        model_info = getattr(state, '_model_info', 'gemini-2.5-flash')
+
+        result = process_single_team(team, question, answer_options, model_info)
+
+        assessment_data = {
+            "team_name": result["team_name"],
+            "assessment": result["assessment"]
         }
-    }
+        formatted_result = {
+            "team_results": [assessment_data],
+            "token_usage": {
+                "input": result["token_usage"]["input_tokens"],
+                "output": result["token_usage"]["output_tokens"]
+            }
+        }
+
+        finish_span(
+            outputs={
+                "team_name": result["team_name"],
+                "token_usage": formatted_result["token_usage"],
+            },
+            usage={
+                "input_tokens": result["token_usage"].get("input_tokens", 0),
+                "output_tokens": result["token_usage"].get("output_tokens", 0),
+                "total_tokens": result["token_usage"].get("input_tokens", 0) + result["token_usage"].get("output_tokens", 0),
+            },
+        )
+
+        return formatted_result
 
 
 def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
     """Compile all team results after parallel processing"""
     team_results = state.get("team_results", [])
     
-    # Categorize assessments by team type
-    assessments = {
-        "initial": [],
-        "specialist": [],
-        "final_review": []
-    }
-    
-    for result in team_results:
-        team_name = result["team_name"].lower()
-        assessment_data = {
-            "team_name": result["team_name"],
-            "assessment": result["assessment"]
+    with langsmith_span(
+        "advanced.compile_team_results",
+        run_type="chain",
+        inputs={
+            "team_count": len(team_results),
+        },
+    ) as (_, finish_span):
+        assessments = {
+            "initial": [],
+            "specialist": [],
+            "final_review": []
         }
-        
-        # Categorize by team type
-        if "initial" in team_name or "iat" in team_name:
-            assessments["initial"].append(assessment_data)
-        elif "final" in team_name or "review" in team_name or "frdt" in team_name:
-            assessments["final_review"].append(assessment_data)
-        else:
-            assessments["specialist"].append(assessment_data)
-    
-    # Compile report
-    compiled_report = compile_assessment_report(assessments)
-    
-    return {
-        "team_assessments": assessments,
-        "compiled_report": compiled_report,
-        "processing_stage": "teams_processed"
-    }
+
+        for result in team_results:
+            team_name = result["team_name"].lower()
+            assessment_data = {
+                "team_name": result["team_name"],
+                "assessment": result["assessment"]
+            }
+
+            if "initial" in team_name or "iat" in team_name:
+                assessments["initial"].append(assessment_data)
+            elif "final" in team_name or "review" in team_name or "frdt" in team_name:
+                assessments["final_review"].append(assessment_data)
+            else:
+                assessments["specialist"].append(assessment_data)
+
+        compiled_report = compile_assessment_report(assessments)
+        total_usage = {
+            "input_tokens": sum(result.get("token_usage", {}).get("input_tokens", 0) for result in team_results),
+            "output_tokens": sum(result.get("token_usage", {}).get("output_tokens", 0) for result in team_results),
+        }
+        total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
+
+        result_state = {
+            "team_assessments": assessments,
+            "compiled_report": compiled_report,
+            "processing_stage": "teams_processed"
+        }
+
+        finish_span(
+            outputs={
+                "initial": len(assessments["initial"]),
+                "specialist": len(assessments["specialist"]),
+                "final_review": len(assessments["final_review"]),
+                "token_usage": total_usage,
+            },
+            usage=total_usage,
+        )
+
+        return result_state
 
 
 # Old complex async wrapper removed - now using LangGraph native parallelization
@@ -855,13 +1019,27 @@ def create_advanced_processing_subgraph(model_info: str = "gemini-2.5-flash") ->
     def categorize_teams_node(state: AdvancedProcessingState) -> Dict[str, Any]:
         """Categorize teams and prepare for parallel processing"""
         teams = state.get("mdt_teams", [])
-        categorized = categorize_teams(teams)
-        
-        return {
-            **state,
-            "team_assessments": categorized,
-            "processing_stage": "teams_categorized"
-        }
+        with langsmith_span(
+            "advanced.categorize_teams",
+            run_type="chain",
+            inputs={
+                "team_count": len(teams),
+            },
+        ) as (_, finish_span):
+            categorized = categorize_teams(teams)
+            result_state = {
+                **state,
+                "team_assessments": categorized,
+                "processing_stage": "teams_categorized"
+            }
+            finish_span(
+                outputs={
+                    "initial": len(categorized.get("initial", [])),
+                    "specialist": len(categorized.get("specialist", [])),
+                    "final_review": len(categorized.get("final_review", [])),
+                }
+            )
+            return result_state
     
     def process_team_1_with_model(state: AdvancedProcessingState) -> Dict[str, Any]:
         """Process team 1 with model info"""

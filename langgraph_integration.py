@@ -18,6 +18,8 @@ from dataclasses import dataclass
 import asyncio
 from functools import wraps
 
+from langsmith_integration import preview_text
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,17 +84,14 @@ class ResultSynthesizer:
     def synthesize_result(self, state: Dict[str, Any], processing_time: float) -> ProcessingResult:
         """Convert LangGraph state to standardized result format"""
         try:
-            # Extract core information
             question = state.get("question", "")
             difficulty = state.get("difficulty", "unknown")
             final_decision = state.get("final_decision", {})
             token_usage = state.get("token_usage", {"input": 0, "output": 0})
             processing_stage = state.get("processing_stage", "unknown")
-            
-            # Determine processing mode from stage
+
             processing_mode = self._extract_processing_mode(processing_stage)
-            
-            # Create standardized result
+
             result = ProcessingResult(
                 question=question,
                 difficulty=difficulty,
@@ -101,15 +100,12 @@ class ResultSynthesizer:
                 processing_time=processing_time,
                 processing_mode=processing_mode,
                 success=bool(final_decision),
-                error_info=None
+                error_info=None,
             )
-            
             self.processed_results.append(result)
             return result
-            
         except Exception as e:
             logger.error(f"Error synthesizing result: {e}")
-            # Return error result
             error_result = ProcessingResult(
                 question=state.get("question", ""),
                 difficulty="unknown",
@@ -118,7 +114,7 @@ class ResultSynthesizer:
                 processing_time=processing_time,
                 processing_mode="error",
                 success=False,
-                error_info={"error": str(e), "type": type(e).__name__}
+                error_info={"error": str(e), "type": type(e).__name__},
             )
             self.processed_results.append(error_result)
             return error_result
@@ -177,10 +173,9 @@ class OutputFormatter:
     def format_for_evaluation(result: ProcessingResult, options: List[str] = None, 
                             ground_truth: str = None) -> Dict[str, Any]:
         """Format result for evaluation script compatibility"""
-        
         # Extract final answer from decision
         final_answer = OutputFormatter._extract_answer(result.final_decision)
-        
+
         # Create evaluation-compatible format
         formatted_result = {
             "question": result.question,
@@ -193,13 +188,13 @@ class OutputFormatter:
             "token_usage": result.token_usage,
             "processing_time": result.processing_time,
             "success": result.success,
-            "timestamp": time.time()
+            "timestamp": time.time(),
         }
-        
+
         # Add error information if present
         if result.error_info:
             formatted_result["error_info"] = result.error_info
-        
+
         return formatted_result
     
     @staticmethod
@@ -319,14 +314,14 @@ class ErrorRecoverySystem:
     def get_fallback_result(self, question: str, error: Exception) -> ProcessingResult:
         """Generate fallback result when all processing fails"""
         logger.warning(f"Generating fallback result for question due to error: {error}")
-        
-        return ProcessingResult(
+
+        fallback = ProcessingResult(
             question=question,
             difficulty="unknown",
             final_decision={
                 "error": "Processing failed",
                 "fallback_answer": "Unable to process question due to system error",
-                "error_details": str(error)
+                "error_details": str(error),
             },
             token_usage={"input": 0, "output": 0},
             processing_time=0.0,
@@ -335,9 +330,10 @@ class ErrorRecoverySystem:
             error_info={
                 "error_type": type(error).__name__,
                 "error_message": str(error),
-                "fallback_used": True
-            }
+                "fallback_used": True,
+            },
         )
+        return fallback
     
     def get_recovery_stats(self) -> Dict[str, Any]:
         """Get error recovery statistics"""
@@ -459,99 +455,184 @@ class IntegratedMDMSystem:
         logger.debug(f"Model: {self.model_info}")
         
         operation_start = self.monitor.start_operation("process_question")
-        
-        try:
-            # Prepare initial state
-            initial_state = {
-                "messages": [],
-                "question": question,
-                "answer_options": options,
-                "agents": [],
-                "token_usage": {"input": 0, "output": 0},
-                "processing_stage": "start",
-                "final_decision": None
-            }
-            
-            # Handle forced difficulty routing
-            if forced_difficulty and forced_difficulty != "adaptive":
-                logger.info(f"Forcing {forced_difficulty} processing mode (skipping difficulty assessment)")
-                initial_state["difficulty"] = forced_difficulty
-                initial_state["confidence"] = 1.0  # High confidence since user specified
-                # We'll handle the routing by directly invoking the specific subgraph
-            
-            logger.debug("Starting LangGraph processing pipeline...")
-            
-            # Process through graph with error recovery
-            @self.error_recovery.with_retry("graph_processing")
-            def process_with_graph():
+        question_preview = preview_text(question)
+        options_count = len(options or [])
+
+        span_inputs = {
+            "question_preview": question_preview,
+            "options_count": options_count,
+            "forced_difficulty": forced_difficulty or "adaptive",
+        }
+
+        # Open a single top-level application span; LangGraph will attach under it
+        from langsmith_integration import span as langsmith_span
+
+        app_run_name = f"MDM.process_question"
+        with langsmith_span(
+            app_run_name,
+            run_type="chain",
+            inputs=span_inputs,
+            metadata={"model": self.model_info},
+            require_parent=False,
+        ) as (_app_run, finish_app):
+            try:
+                # Prepare initial state
+                initial_state = {
+                    "messages": [],
+                    "question": question,
+                    "answer_options": options,
+                    "agents": [],
+                    "token_usage": {"input": 0, "output": 0},
+                    "processing_stage": "start",
+                    "final_decision": None,
+                }
+
+                # Handle forced difficulty routing
                 if forced_difficulty and forced_difficulty != "adaptive":
-                    # Direct processing without full graph
-                    logger.debug(f"Invoking {forced_difficulty} subgraph directly...")
-                    
-                    # Import specific subgraph
-                    if forced_difficulty == "basic":
-                        from langgraph_basic import create_basic_processing_subgraph
-                        subgraph = create_basic_processing_subgraph(self.model_info).compile()
-                    elif forced_difficulty == "intermediate":
-                        from langgraph_intermediate import create_intermediate_processing_subgraph
-                        subgraph = create_intermediate_processing_subgraph(self.model_info).compile()
-                    elif forced_difficulty == "advanced":
-                        from langgraph_advanced import create_advanced_processing_subgraph
-                        subgraph = create_advanced_processing_subgraph(self.model_info).compile()
-                    else:
-                        raise ValueError(f"Unknown forced difficulty: {forced_difficulty}")
-                    
-                    # Execute the specific subgraph
-                    result = subgraph.invoke(initial_state)
-                    result["processing_stage"] = f"{forced_difficulty}_complete"
-                    logger.debug(f"Forced {forced_difficulty} processing completed")
-                    return result
-                else:
-                    # Normal adaptive processing through full graph
+                    logger.info(
+                        f"Forcing {forced_difficulty} processing mode (skipping difficulty assessment)"
+                    )
+                    initial_state["difficulty"] = forced_difficulty
+                    initial_state["confidence"] = 1.0
+
+                logger.debug("Starting LangGraph processing pipeline...")
+
+                @self.error_recovery.with_retry("graph_processing")
+                def process_with_graph():
+                    if forced_difficulty and forced_difficulty != "adaptive":
+                        logger.debug(
+                            f"Invoking {forced_difficulty} subgraph directly..."
+                        )
+
+                        if forced_difficulty == "basic":
+                            from langgraph_basic import (
+                                create_basic_processing_subgraph,
+                            )
+
+                            subgraph = (
+                                create_basic_processing_subgraph(self.model_info).compile()
+                            )
+                        elif forced_difficulty == "intermediate":
+                            from langgraph_intermediate import (
+                                create_intermediate_processing_subgraph,
+                            )
+
+                            subgraph = (
+                                create_intermediate_processing_subgraph(self.model_info).compile()
+                            )
+                        elif forced_difficulty == "advanced":
+                            from langgraph_advanced import (
+                                create_advanced_processing_subgraph,
+                            )
+
+                            subgraph = (
+                                create_advanced_processing_subgraph(self.model_info).compile()
+                            )
+                        else:
+                            raise ValueError(
+                                f"Unknown forced difficulty: {forced_difficulty}"
+                            )
+
+                        run_name = f"MDM:{forced_difficulty}:{self.model_info}"
+                        config = {
+                            "run_name": run_name,
+                            "tags": ["MDM", forced_difficulty, self.model_info],
+                            "metadata": {
+                                "question_preview": question_preview,
+                                "options_count": options_count,
+                            },
+                        }
+                        result = subgraph.invoke(initial_state, config=config)
+                        result["processing_stage"] = f"{forced_difficulty}_complete"
+                        logger.debug(
+                            f"Forced {forced_difficulty} processing completed"
+                        )
+                        return result
+
                     logger.debug("Invoking compiled LangGraph...")
-                    result = self.compiled_graph.invoke(initial_state)
-                    logger.debug(f"LangGraph processing completed. Final stage: {result.get('processing_stage', 'unknown')}")
+                    run_name = f"MDM:{forced_difficulty or 'adaptive'}:{self.model_info}"
+                    config = {
+                        "run_name": run_name,
+                        "tags": [
+                            "MDM",
+                            forced_difficulty or "adaptive",
+                            self.model_info,
+                        ],
+                        "metadata": {
+                            "question_preview": question_preview,
+                            "options_count": options_count,
+                        },
+                    }
+                    result = self.compiled_graph.invoke(initial_state, config=config)
+                    logger.debug(
+                        "LangGraph processing completed. Final stage: %s",
+                        result.get("processing_stage", "unknown"),
+                    )
                     return result
-            
-            # Execute processing
-            processing_start = time.time()
-            result_state = process_with_graph()
-            processing_time = time.time() - processing_start
-            
-            logger.debug(f"Total processing time: {processing_time:.3f} seconds")
-            logger.debug(f"Final difficulty: {result_state.get('difficulty', 'unknown')}")
-            logger.debug(f"Token usage: {result_state.get('token_usage', {})}")
-            
-            # Synthesize result
-            synthesized_result = self.synthesizer.synthesize_result(result_state, processing_time)
-            
-            # Format for evaluation
-            formatted_result = self.formatter.format_for_evaluation(
-                synthesized_result, options, ground_truth
-            )
-            
-            # Record successful processing
-            self.monitor.end_operation("process_question", operation_start, 
-                                     synthesized_result.token_usage)
-            self.monitor.record_health_check("question_processing", True, 
-                                           f"Successfully processed: {synthesized_result.processing_mode}")
-            
-            return formatted_result
-            
-        except Exception as e:
-            # Handle complete failure with fallback
-            logger.error(f"Complete processing failure for question: {e}")
-            
-            fallback_result = self.error_recovery.get_fallback_result(question, e)
-            formatted_result = self.formatter.format_for_evaluation(
-                fallback_result, options, ground_truth
-            )
-            
-            # Record failure
-            self.monitor.end_operation("process_question", operation_start, {"input": 0, "output": 0})
-            self.monitor.record_health_check("question_processing", False, f"Failed: {str(e)}")
-            
-            return formatted_result
+
+                processing_start = time.time()
+                result_state = process_with_graph()
+                processing_time = time.time() - processing_start
+
+                logger.debug(
+                    f"Total processing time: {processing_time:.3f} seconds"
+                )
+                logger.debug(
+                    f"Final difficulty: {result_state.get('difficulty', 'unknown')}"
+                )
+                logger.debug(
+                    f"Token usage: {result_state.get('token_usage', {})}"
+                )
+
+                synthesized_result = self.synthesizer.synthesize_result(
+                    result_state, processing_time
+                )
+                formatted_result = self.formatter.format_for_evaluation(
+                    synthesized_result, options, ground_truth
+                )
+
+                self.monitor.end_operation(
+                    "process_question", operation_start, synthesized_result.token_usage
+                )
+                self.monitor.record_health_check(
+                    "question_processing", True,
+                    f"Successfully processed: {synthesized_result.processing_mode}"
+                )
+
+                # Report aggregate usage and status to the top-level span
+                total_usage = {
+                    "input": synthesized_result.token_usage.get("input", 0),
+                    "output": synthesized_result.token_usage.get("output", 0),
+                }
+                finish_app(
+                    outputs={
+                        "status": "success",
+                        "processing_mode": synthesized_result.processing_mode,
+                        "processing_time": synthesized_result.processing_time,
+                    },
+                    usage=total_usage,
+                )
+                return formatted_result
+
+            except Exception as e:
+                logger.error(f"Complete processing failure for question: {e}")
+
+                fallback_result = self.error_recovery.get_fallback_result(
+                    question, e
+                )
+                formatted_result = self.formatter.format_for_evaluation(
+                    fallback_result, options, ground_truth
+                )
+
+                self.monitor.end_operation(
+                    "process_question", operation_start, {"input": 0, "output": 0}
+                )
+                self.monitor.record_health_check(
+                    "question_processing", False, f"Failed: {str(e)}"
+                )
+
+                finish_app(outputs={"status": "fallback", "error": str(e)})
+                return formatted_result
     
     def get_system_status(self) -> Dict[str, Any]:
         """Get comprehensive system status and metrics"""

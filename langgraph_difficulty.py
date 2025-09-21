@@ -10,6 +10,8 @@ import logging
 from typing import Dict, Any, Literal
 from langgraph.types import Command
 from langgraph_mdm import LangGraphAgent, MDMStateDict
+from langsmith_integration import preview_text
+from langsmith_integration import span as langsmith_span
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -133,44 +135,64 @@ Provide your assessment in the following JSON format:
         """
         question = state.get("question", "")
         current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        
-        try:
-            # Get LLM response
-            response, usage = self._call_llm(question)
-            
-            # Parse JSON response
-            difficulty, confidence = self._parse_response(response)
-            
-            # Update token usage
-            updated_usage = {
-                "input": current_usage["input"] + usage["input_tokens"],
-                "output": current_usage["output"] + usage["output_tokens"]
-            }
-            
-            # Determine routing destination
-            routing_destination = f"{difficulty}_processing"
-            
-            # Return Command object with state updates and routing
-            return Command(
-                update={
-                    "difficulty": difficulty,
-                    "confidence": confidence,
-                    "token_usage": updated_usage
-                },
-                goto=routing_destination
-            )
-            
-        except Exception as e:
-            print(f"Error in difficulty assessment: {e}")
-            # Fallback to safe default
-            return Command(
-                update={
-                    "difficulty": "intermediate",
-                    "confidence": 0.5,
-                    "token_usage": current_usage
-                },
-                goto="intermediate_processing"
-            )
+        question_preview = preview_text(question)
+
+        with langsmith_span(
+            "difficulty.assess",
+            run_type="chain",
+            inputs={
+                "question_preview": question_preview,
+                "token_input": current_usage.get("input"),
+                "token_output": current_usage.get("output"),
+            },
+        ) as (_, finish_span):
+            try:
+                # Get LLM response
+                response, usage = self._call_llm(question)
+
+                # Parse JSON response
+                difficulty, confidence = self._parse_response(response)
+
+                # Update token usage
+                updated_usage = {
+                    "input": current_usage["input"] + usage["input_tokens"],
+                    "output": current_usage["output"] + usage["output_tokens"]
+                }
+
+                # Determine routing destination
+                routing_destination = f"{difficulty}_processing"
+
+                finish_span(
+                    outputs={
+                        "difficulty": difficulty,
+                        "confidence": confidence,
+                        "goto": routing_destination,
+                        "token_usage": updated_usage,
+                    },
+                    usage=usage,
+                )
+
+                return Command(
+                    update={
+                        "difficulty": difficulty,
+                        "confidence": confidence,
+                        "token_usage": updated_usage
+                    },
+                    goto=routing_destination
+                )
+
+            except Exception as e:
+                logger.error(f"Error in difficulty assessment: {e}")
+                finish_span(error=e)
+                # Fallback to safe default
+                return Command(
+                    update={
+                        "difficulty": "intermediate",
+                        "confidence": 0.5,
+                        "token_usage": current_usage
+                    },
+                    goto="intermediate_processing"
+                )
     
     def _parse_response(self, response: str) -> tuple[str, float]:
         """

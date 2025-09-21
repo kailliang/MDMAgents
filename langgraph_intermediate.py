@@ -20,6 +20,8 @@ from typing import Dict, List, Any, Optional, TypedDict
 from langgraph.graph import StateGraph
 from langgraph.types import Command
 from langgraph_mdm import LangGraphAgent
+from langsmith_integration import preview_text
+from langsmith_integration import span as langsmith_span
 
 
 class IntermediateProcessingState(TypedDict, total=False):
@@ -80,6 +82,7 @@ class HierarchicalExpertRecruitmentNode:
         """Recruit 3 experts with hierarchical relationships"""
         question = state["question"]
         answer_options = state.get("answer_options", [])
+        question_preview = preview_text(question)
         
         # Format answer options
         options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
@@ -119,48 +122,64 @@ Please return your recruitment plan in JSON format:
 
 Return ONLY the JSON, no other text."""
         
-        response, token_usage = self._call_llm(recruitment_prompt)
-        
-        # Parse JSON response
-        try:
-            # Clean JSON response
-            cleaned_response = response.strip()
-            if cleaned_response.startswith('```json'):
-                cleaned_response = cleaned_response[7:]
-            if cleaned_response.startswith('```'):
-                cleaned_response = cleaned_response[3:]
-            if cleaned_response.endswith('```'):
-                cleaned_response = cleaned_response[:-3]
-            
-            experts_data = json.loads(cleaned_response)
-            recruited_experts = experts_data.get('experts', [])
-            
-            if len(recruited_experts) != 3:
-                raise ValueError(f"Expected 3 experts, got {len(recruited_experts)}")
-                
-        except (json.JSONDecodeError, ValueError):
-            # Fallback to default experts
-            recruited_experts = [
-                {"id": 1, "role": "General Internal Medicine Physician", "description": "Comprehensive adult care", "hierarchy": "Independent"},
-                {"id": 2, "role": "Emergency Medicine Physician", "description": "Acute care specialist", "hierarchy": "Independent"},
-                {"id": 3, "role": "Family Medicine Physician", "description": "Primary care specialist", "hierarchy": "Independent"}
-            ]
-        
-        # Update token usage
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "experts_hierarchy": recruited_experts,
-                "token_usage": updated_usage,
-                "processing_stage": "expert_recruitment_complete"
+        with langsmith_span(
+            "intermediate.recruit_experts",
+            run_type="chain",
+            inputs={
+                "question_preview": question_preview,
+                "options_count": len(answer_options or []),
             },
-            goto="initial_opinions"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(recruitment_prompt)
+            
+            # Parse JSON response
+            try:
+                # Clean JSON response
+                cleaned_response = response.strip()
+                if cleaned_response.startswith('```json'):
+                    cleaned_response = cleaned_response[7:]
+                if cleaned_response.startswith('```'):
+                    cleaned_response = cleaned_response[3:]
+                if cleaned_response.endswith('```'):
+                    cleaned_response = cleaned_response[:-3]
+                
+                experts_data = json.loads(cleaned_response)
+                recruited_experts = experts_data.get('experts', [])
+                
+                if len(recruited_experts) != 3:
+                    raise ValueError(f"Expected 3 experts, got {len(recruited_experts)}")
+                    
+            except (json.JSONDecodeError, ValueError):
+                # Fallback to default experts
+                recruited_experts = [
+                    {"id": 1, "role": "General Internal Medicine Physician", "description": "Comprehensive adult care", "hierarchy": "Independent"},
+                    {"id": 2, "role": "Emergency Medicine Physician", "description": "Acute care specialist", "hierarchy": "Independent"},
+                    {"id": 3, "role": "Family Medicine Physician", "description": "Primary care specialist", "hierarchy": "Independent"}
+                ]
+            
+            # Update token usage
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "experts": [expert.get("role") for expert in recruited_experts],
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "experts_hierarchy": recruited_experts,
+                    "token_usage": updated_usage,
+                    "processing_stage": "expert_recruitment_complete"
+                },
+                goto="initial_opinions"
+            )
 
 
 class DebateParticipationNode:
@@ -230,40 +249,57 @@ Return your response in JSON format:
   "reason": "brief explanation"
 }}"""
         
-        response, token_usage = self._call_llm(participation_prompt)
-        
-        # Parse participation decision
-        try:
-            decision_json = json.loads(response)
-            participate = decision_json.get('participate', False)
-            reason = decision_json.get('reason', 'No reason provided')
-        except (json.JSONDecodeError, TypeError):
-            # Fallback to text parsing
-            participate = 'yes' in response.lower() or 'true' in response.lower()
-            reason = response[:100] if response else "Parsed from text"
-        
-        # Update state with decision
-        current_decisions = state.get("participation_decisions", [])
-        new_decision = {
-            "expert_id": self.expert["id"],
-            "participate": participate,
-            "reason": reason,
-            "round": round_num
-        }
-        
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "participation_decisions": current_decisions + [new_decision],
-                "token_usage": updated_usage
+        with langsmith_span(
+            "intermediate.debate_participation",
+            run_type="chain",
+            inputs={
+                "expert_id": self.expert.get("id"),
+                "expert_role": self.expert.get("role"),
+                "round": round_num,
             },
-            goto="check_participation"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(participation_prompt)
+            
+            # Parse participation decision
+            try:
+                decision_json = json.loads(response)
+                participate = decision_json.get('participate', False)
+                reason = decision_json.get('reason', 'No reason provided')
+            except (json.JSONDecodeError, TypeError):
+                # Fallback to text parsing
+                participate = 'yes' in response.lower() or 'true' in response.lower()
+                reason = response[:100] if response else "Parsed from text"
+            
+            # Update state with decision
+            current_decisions = state.get("participation_decisions", [])
+            new_decision = {
+                "expert_id": self.expert["id"],
+                "participate": participate,
+                "reason": reason,
+                "round": round_num
+            }
+            
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "participate": participate,
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "participation_decisions": current_decisions + [new_decision],
+                    "token_usage": updated_usage
+                },
+                goto="check_participation"
+            )
 
 
 class ExpertSelectionNode:
@@ -317,39 +353,56 @@ Return your response in JSON format:
   "reason": "Need to discuss specific points"
 }}"""
         
-        response, token_usage = self._call_llm(selection_prompt)
-        
-        # Parse selection
-        try:
-            selection_json = json.loads(response)
-            selected = selection_json.get('selected_experts', [])
-            reason = selection_json.get('reason', '')
-        except (json.JSONDecodeError, TypeError):
-            # Fallback parsing
-            selected = [int(s) for s in re.findall(r'\d+', response) if 1 <= int(s) <= len(experts)]
-            reason = "Parsed from text"
-        
-        # Update state
-        current_selections = state.get("expert_selections", [])
-        new_selection = {
-            "source_expert_id": self.expert["id"],
-            "selected_experts": selected,
-            "reason": reason
-        }
-        
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "expert_selections": current_selections + [new_selection],
-                "token_usage": updated_usage
+        with langsmith_span(
+            "intermediate.select_experts",
+            run_type="chain",
+            inputs={
+                "expert_id": self.expert.get("id"),
+                "expert_role": self.expert.get("role"),
+                "available_experts": [e.get("id") for e in experts],
             },
-            goto="generate_communications"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(selection_prompt)
+            
+            # Parse selection
+            try:
+                selection_json = json.loads(response)
+                selected = selection_json.get('selected_experts', [])
+                reason = selection_json.get('reason', '')
+            except (json.JSONDecodeError, TypeError):
+                # Fallback parsing
+                selected = [int(s) for s in re.findall(r'\d+', response) if 1 <= int(s) <= len(experts)]
+                reason = "Parsed from text"
+            
+            # Update state
+            current_selections = state.get("expert_selections", [])
+            new_selection = {
+                "source_expert_id": self.expert["id"],
+                "selected_experts": selected,
+                "reason": reason
+            }
+            
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "selected_count": len(selected),
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "expert_selections": current_selections + [new_selection],
+                    "token_usage": updated_usage
+                },
+                goto="generate_communications"
+            )
 
 
 class ExpertCommunicationNode:
@@ -404,38 +457,53 @@ Answer Options:
 
 Deliver your opinion to convince the other expert. Focus on determining the correct answer from the options above. Limit to 200 words."""
         
-        response, token_usage = self._call_llm(comm_prompt)
-        
-        # Update interaction log
-        round_num = state.get("round_number", 1)
-        turn_num = state.get("turn_number", 1)
-        interaction_log = state.get("interaction_log", {})
-        
-        # Initialize nested structure if needed
-        if f"Round {round_num}" not in interaction_log:
-            interaction_log[f"Round {round_num}"] = {}
-        if f"Turn {turn_num}" not in interaction_log[f"Round {round_num}"]:
-            interaction_log[f"Round {round_num}"][f"Turn {turn_num}"] = {}
-        
-        # Record interaction
-        source_id = self.source_expert["id"]
-        target_id = self.target_expert["id"]
-        interaction_log[f"Round {round_num}"][f"Turn {turn_num}"][f"Expert {source_id} to {target_id}"] = response
-        
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "interaction_log": interaction_log,
-                "communication_content": response,
-                "token_usage": updated_usage
+        with langsmith_span(
+            "intermediate.generate_communication",
+            run_type="chain",
+            inputs={
+                "source_expert": self.source_expert.get("id"),
+                "target_expert": self.target_expert.get("id"),
             },
-            goto="continue_debate"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(comm_prompt)
+            
+            # Update interaction log
+            round_num = state.get("round_number", 1)
+            turn_num = state.get("turn_number", 1)
+            interaction_log = state.get("interaction_log", {})
+            
+            if f"Round {round_num}" not in interaction_log:
+                interaction_log[f"Round {round_num}"] = {}
+            if f"Turn {turn_num}" not in interaction_log[f"Round {round_num}"]:
+                interaction_log[f"Round {round_num}"][f"Turn {turn_num}"] = {}
+            
+            source_id = self.source_expert["id"]
+            target_id = self.target_expert["id"]
+            interaction_log[f"Round {round_num}"][f"Turn {turn_num}"][f"Expert {source_id} to {target_id}"] = response
+            
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "round": round_num,
+                    "turn": turn_num,
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "interaction_log": interaction_log,
+                    "communication_content": response,
+                    "token_usage": updated_usage
+                },
+                goto="continue_debate"
+            )
 
 
 class RoundSynthesisNode:
@@ -476,41 +544,63 @@ class RoundSynthesisNode:
         next_round_opinions = {}
         total_tokens = {"input": 0, "output": 0}
         
-        for expert in experts:
-            role = expert.get("role", "expert")
-            
-            synthesis_prompt = f"""Reflecting on the discussions in Round {round_num}, what is your current opinion on:
+        with langsmith_span(
+            "intermediate.synthesize_round",
+            run_type="chain",
+            inputs={
+                "round": round_num,
+                "experts": [expert.get("role") for expert in experts],
+            },
+        ) as (_, finish_span):
+            for expert in experts:
+                role = expert.get("role", "expert")
+                
+                synthesis_prompt = f"""Reflecting on the discussions in Round {round_num}, what is your current opinion on:
 {question}
 
 Answer Options:
 {options_text}
 
 Focus on determining the correct answer from the options above. Limit your answer to 50 words."""
+                
+                response, token_usage = self._call_llm(synthesis_prompt, role)
+                next_round_opinions[role.lower()] = response
+                
+                total_tokens["input"] += token_usage["input_tokens"]
+                total_tokens["output"] += token_usage["output_tokens"]
             
-            response, token_usage = self._call_llm(synthesis_prompt, role)
-            next_round_opinions[role.lower()] = response
+            # Update round opinions
+            round_opinions = state.get("round_opinions", {})
+            round_opinions[round_num + 1] = next_round_opinions
             
-            total_tokens["input"] += token_usage["input_tokens"]
-            total_tokens["output"] += token_usage["output_tokens"]
-        
-        # Update round opinions
-        round_opinions = state.get("round_opinions", {})
-        round_opinions[round_num + 1] = next_round_opinions
-        
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + total_tokens["input"],
-            "output": current_usage["output"] + total_tokens["output"]
-        }
-        
-        return Command(
-            update={
-                "round_opinions": round_opinions,
-                "round_number": round_num + 1,
-                "token_usage": updated_usage
-            },
-            goto="check_next_round"
-        )
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + total_tokens["input"],
+                "output": current_usage["output"] + total_tokens["output"]
+            }
+
+            round_usage = {
+                "input_tokens": total_tokens["input"],
+                "output_tokens": total_tokens["output"],
+                "total_tokens": total_tokens["input"] + total_tokens["output"],
+            }
+
+            finish_span(
+                outputs={
+                    "opinions_recorded": len(next_round_opinions),
+                    "token_usage": updated_usage,
+                },
+                usage=round_usage,
+            )
+
+            return Command(
+                update={
+                    "round_opinions": round_opinions,
+                    "round_number": round_num + 1,
+                    "token_usage": updated_usage
+                },
+                goto="check_next_round"
+            )
 
 
 class ModeratorConsensusNode:
@@ -549,6 +639,7 @@ class ModeratorConsensusNode:
         question = state["question"]
         answer_options = state.get("answer_options", [])
         final_opinions = state.get("final_expert_opinions", {})
+        question_preview = preview_text(question)
         
         # Format expert opinions
         opinions_text = "\n".join([f"{k}: {v}" for k, v in final_opinions.items()])
@@ -578,50 +669,61 @@ Provide your final decision in exactly this JSON format:
 - Return ONLY the JSON, no other text
 """
         
-        response, token_usage = self._call_llm(consensus_prompt)
-        
-        # Parse JSON response to extract clean answer
-        try:
-            # Try to extract JSON from response
-            json_match = re.search(r'\{[^{}]*"majority_vote"\s*:\s*"([^"]*)"[^{}]*\}', response, re.DOTALL)
-            if json_match:
-                majority_vote = json_match.group(1)
-            else:
-                # Fallback - try to parse as full JSON
-                import json
-                clean_response = response.strip()
-                if clean_response.startswith('```json\n'):
-                    clean_response = clean_response[8:-3].strip()  # Remove ```json\n and \n```
-                
-                parsed = json.loads(clean_response)
-                majority_vote = parsed.get("majority_vote", "Parse error")
-        except Exception as e:
-            # Final fallback - extract any answer-like pattern
-            answer_match = re.search(r'[A-E]\)\s*[^"]*', response)
-            majority_vote = answer_match.group(0) if answer_match else "Parse error"
-        
-        # Create final decision
-        final_decision = {
-            "majority_vote": majority_vote,
-            "raw_response": response,  # Keep full response for debugging
-            "expert_count": len(final_opinions),
-            "consensus_method": "moderator_synthesis"
-        }
-        
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + token_usage["input_tokens"],
-            "output": current_usage["output"] + token_usage["output_tokens"]
-        }
-        
-        return Command(
-            update={
-                "final_decision": final_decision,
-                "token_usage": updated_usage,
-                "processing_stage": "intermediate_complete"
+        with langsmith_span(
+            "intermediate.moderator_consensus",
+            run_type="chain",
+            inputs={
+                "question_preview": question_preview,
+                "experts": list(final_opinions.keys()),
             },
-            goto="intermediate_complete"
-        )
+        ) as (_, finish_span):
+            response, token_usage = self._call_llm(consensus_prompt)
+            
+            # Parse JSON response to extract clean answer
+            try:
+                json_match = re.search(r'\{[^{}]*"majority_vote"\s*:\s*"([^"]*)"[^{}]*\}', response, re.DOTALL)
+                if json_match:
+                    majority_vote = json_match.group(1)
+                else:
+                    clean_response = response.strip()
+                    if clean_response.startswith('```json\n'):
+                        clean_response = clean_response[8:-3].strip()
+                    parsed = json.loads(clean_response)
+                    majority_vote = parsed.get("majority_vote", "Parse error")
+            except Exception:
+                answer_match = re.search(r'[A-E]\)\s*[^"]*', response)
+                majority_vote = answer_match.group(0) if answer_match else "Parse error"
+            
+            # Create final decision
+            final_decision = {
+                "majority_vote": majority_vote,
+                "raw_response": response,
+                "expert_count": len(final_opinions),
+                "consensus_method": "moderator_synthesis"
+            }
+            
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + token_usage["input_tokens"],
+                "output": current_usage["output"] + token_usage["output_tokens"]
+            }
+
+            finish_span(
+                outputs={
+                    "majority_vote": majority_vote,
+                    "token_usage": updated_usage,
+                },
+                usage=token_usage,
+            )
+
+            return Command(
+                update={
+                    "final_decision": final_decision,
+                    "token_usage": updated_usage,
+                    "processing_stage": "intermediate_complete"
+                },
+                goto="intermediate_complete"
+            )
 
 
 # Utility functions
@@ -745,20 +847,33 @@ def create_intermediate_processing_subgraph(model_info: str = "gemini-2.5-flash"
         
         initial_opinions = {}
         total_tokens = {"input": 0, "output": 0}
-        
-        for expert in experts:
-            # Mock opinion for now
-            role = expert.get("role", "expert").lower()
-            initial_opinions[role] = f"Initial assessment from {role}"
-            # In real implementation, would call LLM here
-        
-        round_opinions = {1: initial_opinions}
-        
-        return {
-            **state,
-            "round_opinions": round_opinions,
-            "round_number": 1
-        }
+
+        with langsmith_span(
+            "intermediate.collect_initial_opinions",
+            run_type="chain",
+            inputs={
+                "experts": [expert.get("role") for expert in experts],
+                "question_preview": preview_text(question),
+            },
+        ) as (_, finish_span):
+            for expert in experts:
+                role = expert.get("role", "expert").lower()
+                initial_opinions[role] = f"Initial assessment from {role}"
+
+            round_opinions = {1: initial_opinions}
+            result_state = {
+                **state,
+                "round_opinions": round_opinions,
+                "round_number": 1
+            }
+
+            finish_span(
+                outputs={
+                    "opinions_initialized": len(initial_opinions),
+                }
+            )
+
+            return result_state
     
     def parse_combined_decision(response: str) -> Dict[str, Any]:
         """Parse combined participation and selection JSON response"""
@@ -893,25 +1008,48 @@ Answer Options:
     
     def multi_round_debate(state: IntermediateProcessingState) -> Dict[str, Any]:
         """Conduct multi-round debate with participation consent system - OPTIMIZED with parallel processing"""
-        # Run the async version internally using existing event loop or create new one
         import asyncio
-        try:
-            # Try to get the current event loop
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If loop is already running, we need to create a task and wait
-                # For now, fall back to a simpler approach - run in thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, _multi_round_debate_async(state))
-                    return future.result()
-            else:
-                return loop.run_until_complete(_multi_round_debate_async(state))
-        except RuntimeError:
-            # No event loop exists, create a new one
-            return asyncio.run(_multi_round_debate_async(state))
+
+        with langsmith_span(
+            "intermediate.multi_round_debate",
+            run_type="chain",
+            inputs={
+                "round_number": state.get("round_number", 1),
+                "experts": [expert.get("role") for expert in state.get("experts_hierarchy", [])],
+            },
+        ) as (debate_run, finish_span):
+            result = None
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(
+                            asyncio.run,
+                            _multi_round_debate_async(state, parent_run=debate_run),
+                        )
+                        result = future.result()
+                else:
+                    result = loop.run_until_complete(
+                        _multi_round_debate_async(state, parent_run=debate_run)
+                    )
+            except RuntimeError:
+                result = asyncio.run(_multi_round_debate_async(state, parent_run=debate_run))
+            except Exception as exc:
+                finish_span(error=exc)
+                raise
+
+            finish_span(
+                outputs={
+                    "processing_stage": result.get("processing_stage"),
+                    "token_usage": result.get("token_usage"),
+                }
+            )
+            return result
     
-    async def _multi_round_debate_async(state: IntermediateProcessingState) -> Dict[str, Any]:
+    async def _multi_round_debate_async(
+        state: IntermediateProcessingState, *, parent_run: Any = None
+    ) -> Dict[str, Any]:
         """Conduct multi-round debate with participation consent system - OPTIMIZED with parallel processing"""
         experts = state.get("experts_hierarchy", [])
         question = state["question"]
@@ -919,187 +1057,194 @@ Answer Options:
         model_info = getattr(state, '_model_info', 'gemini-2.5-flash')  # Get model info from state
         current_round = state.get("round_number", 1)
         max_rounds = 3
-        
-        # Initialize tracking variables
-        total_tokens = {"input": 0, "output": 0}
-        interaction_log = state.get("interaction_log", {})
-        round_opinions = state.get("round_opinions", {})
-        
-        # Prepare expert list for selection prompts
-        expert_list = "\n".join([f"{e['id']}. {e['role']}" for e in experts])
-        
-        # Main debate loop for remaining rounds
-        for round_num in range(current_round, max_rounds + 1):
-            if round_num not in round_opinions:
-                continue
-                
-            round_name = f"Round {round_num}"
-            if round_name not in interaction_log:
-                interaction_log[round_name] = {}
-            
-            # Current assessment for participation decisions
-            current_assessment = round_opinions.get(round_num, {})
-            assessment_str = "\n".join([f"({k}): {v}" for k, v in current_assessment.items()])
-            
-            # PARALLEL EXECUTION: Get all participation decisions + selections at once
-            participation_tasks = [
-                get_participation_and_selection_async(expert, assessment_str, expert_list, model_info)
-                for expert in experts
-            ]
-            
-            try:
-                participation_results = await asyncio.gather(*participation_tasks)
-            except Exception as e:
-                print(f"Error in parallel participation: {e}")
-                # Fallback to sequential processing
-                participation_results = []
-                for expert in experts:
-                    result = await get_participation_and_selection_async(expert, assessment_str, expert_list, model_info)
-                    participation_results.append(result)
-            
-            # Process participation results
-            any_participated = False
-            expert_decisions = {}
-            
-            for i, (decision, token_usage) in enumerate(participation_results):
-                expert = experts[i]
-                expert_decisions[expert['id']] = decision
-                
-                # Update token usage
-                total_tokens["input"] += token_usage["input_tokens"]
-                total_tokens["output"] += token_usage["output_tokens"]
-                
-                if decision['participate']:
-                    any_participated = True
-            
-            # Generate communications in parallel for participating experts
-            communication_tasks = []
-            for expert in experts:
-                decision = expert_decisions[expert['id']]
-                if decision['participate'] and decision['selected_experts']:
-                    # Create communication tasks for each selected target expert
-                    for target_id in decision['selected_experts']:
-                        if 1 <= target_id <= len(experts):
-                            target_expert = next((e for e in experts if e["id"] == target_id), None)
-                            if target_expert:
-                                task = generate_communication_async(expert, target_expert, question, answer_options, model_info)
-                                communication_tasks.append((expert, target_expert, task))
-            
-            # PARALLEL EXECUTION: Execute all communications at once
-            if communication_tasks:
+
+        span_ctx = langsmith_span(
+            "intermediate.multi_round_debate_async",
+            run_type="chain",
+            inputs={
+                "start_round": current_round,
+                "experts": [expert.get("role") for expert in experts],
+            },
+            parent=parent_run,
+        )
+        _span_run, finish_span = span_ctx.__enter__()
+        try:
+            # Initialize tracking variables
+            total_tokens = {"input": 0, "output": 0}
+            interaction_log = state.get("interaction_log", {})
+            round_opinions = state.get("round_opinions", {})
+
+            # Prepare expert list for selection prompts
+            expert_list = "\n".join([f"{e['id']}. {e['role']}" for e in experts])
+
+            # Main debate loop for remaining rounds
+            for round_num in range(current_round, max_rounds + 1):
+                if round_num not in round_opinions:
+                    continue
+
+                round_name = f"Round {round_num}"
+                if round_name not in interaction_log:
+                    interaction_log[round_name] = {}
+
+                current_assessment = round_opinions.get(round_num, {})
+                assessment_str = "\n".join([f"({k}): {v}" for k, v in current_assessment.items()])
+
+                participation_tasks = [
+                    get_participation_and_selection_async(expert, assessment_str, expert_list, model_info)
+                    for expert in experts
+                ]
+
                 try:
-                    # Extract just the tasks for parallel execution
-                    task_list = [task_info[2] for task_info in communication_tasks]
-                    communication_results = await asyncio.gather(*task_list)
-                    
-                    # Process communication results and log interactions
-                    for i, (source_expert, target_expert, _) in enumerate(communication_tasks):
-                        comm_response, comm_tokens = communication_results[i]
-                        
-                        # Update token usage
-                        total_tokens["input"] += comm_tokens["input_tokens"]
-                        total_tokens["output"] += comm_tokens["output_tokens"]
-                        
-                        # Log the interaction
-                        source_key = f"Agent {source_expert['id']}"
-                        target_key = f"Agent {target_expert['id']}"
-                        if source_key not in interaction_log[round_name]:
-                            interaction_log[round_name][source_key] = {}
-                        interaction_log[round_name][source_key][target_key] = comm_response
-                        
+                    participation_results = await asyncio.gather(*participation_tasks)
                 except Exception as e:
-                    print(f"Error in parallel communications: {e}")
-                    # Fallback to sequential processing for communications
-                    for source_expert, target_expert, task in communication_tasks:
-                        try:
-                            comm_response, comm_tokens = await task
+                    print(f"Error in parallel participation: {e}")
+                    participation_results = []
+                    for expert in experts:
+                        result = await get_participation_and_selection_async(expert, assessment_str, expert_list, model_info)
+                        participation_results.append(result)
+
+                any_participated = False
+                expert_decisions = {}
+
+                for i, (decision, token_usage) in enumerate(participation_results):
+                    expert = experts[i]
+                    expert_decisions[expert['id']] = decision
+
+                    total_tokens["input"] += token_usage["input_tokens"]
+                    total_tokens["output"] += token_usage["output_tokens"]
+
+                    if decision['participate']:
+                        any_participated = True
+
+                communication_tasks = []
+                for expert in experts:
+                    decision = expert_decisions.get(expert['id'], {})
+                    if decision.get('participate') and decision.get('selected_experts'):
+                        for target_id in decision['selected_experts']:
+                            if 1 <= target_id <= len(experts):
+                                target_expert = next((e for e in experts if e["id"] == target_id), None)
+                                if target_expert:
+                                    task = generate_communication_async(expert, target_expert, question, answer_options, model_info)
+                                    communication_tasks.append((expert, target_expert, task))
+
+                if communication_tasks:
+                    try:
+                        task_list = [task_info[2] for task_info in communication_tasks]
+                        communication_results = await asyncio.gather(*task_list)
+
+                        for i, (source_expert, target_expert, _) in enumerate(communication_tasks):
+                            comm_response, comm_tokens = communication_results[i]
                             total_tokens["input"] += comm_tokens["input_tokens"]
                             total_tokens["output"] += comm_tokens["output_tokens"]
-                            
+
                             source_key = f"Agent {source_expert['id']}"
                             target_key = f"Agent {target_expert['id']}"
                             if source_key not in interaction_log[round_name]:
                                 interaction_log[round_name][source_key] = {}
                             interaction_log[round_name][source_key][target_key] = comm_response
-                        except Exception as task_error:
-                            print(f"Error in individual communication task: {task_error}")
-            
-            # If no one participated in this round (after round 1), end debate
-            if not any_participated and round_num > 1:
-                break
-                
-            # PARALLEL EXECUTION: Collect updated opinions for next round  
-            if round_num < max_rounds:
-                opinion_tasks = [
-                    collect_expert_opinion_async(expert, round_num, question, answer_options, model_info)
-                    for expert in experts
-                ]
-                
-                try:
-                    opinion_results = await asyncio.gather(*opinion_tasks)
-                    next_round_opinions = {}
-                    
-                    for i, (opinion_response, usage) in enumerate(opinion_results):
-                        expert = experts[i]
-                        total_tokens["input"] += usage["input_tokens"]
-                        total_tokens["output"] += usage["output_tokens"]
-                        next_round_opinions[expert['role'].lower()] = opinion_response
-                    
-                    round_opinions[round_num + 1] = next_round_opinions
-                    
-                except Exception as e:
-                    print(f"Error in parallel opinion collection: {e}")
-                    # Fallback to sequential processing
-                    next_round_opinions = {}
-                    for expert in experts:
-                        opinion_response, usage = await collect_expert_opinion_async(expert, round_num, question, answer_options, model_info)
-                        total_tokens["input"] += usage["input_tokens"]
-                        total_tokens["output"] += usage["output_tokens"]
-                        next_round_opinions[expert['role'].lower()] = opinion_response
-                    round_opinions[round_num + 1] = next_round_opinions
+
+                    except Exception as e:
+                        print(f"Error in parallel communications: {e}")
+                        for source_expert, target_expert, task in communication_tasks:
+                            try:
+                                comm_response, comm_tokens = await task
+                                total_tokens["input"] += comm_tokens["input_tokens"]
+                                total_tokens["output"] += comm_tokens["output_tokens"]
+
+                                source_key = f"Agent {source_expert['id']}"
+                                target_key = f"Agent {target_expert['id']}"
+                                if source_key not in interaction_log[round_name]:
+                                    interaction_log[round_name][source_key] = {}
+                                interaction_log[round_name][source_key][target_key] = comm_response
+                            except Exception as task_error:
+                                print(f"Error in individual communication task: {task_error}")
+
+                if not any_participated and round_num > 1:
+                    break
+
+                if round_num < max_rounds:
+                    opinion_tasks = [
+                        collect_expert_opinion_async(expert, round_num, question, answer_options, model_info)
+                        for expert in experts
+                    ]
+
+                    try:
+                        opinion_results = await asyncio.gather(*opinion_tasks)
+                        next_round_opinions = {}
+
+                        for i, (opinion_response, usage) in enumerate(opinion_results):
+                            expert = experts[i]
+                            total_tokens["input"] += usage["input_tokens"]
+                            total_tokens["output"] += usage["output_tokens"]
+                            next_round_opinions[expert['role'].lower()] = opinion_response
+
+                        round_opinions[round_num + 1] = next_round_opinions
+
+                    except Exception as e:
+                        print(f"Error in parallel opinion collection: {e}")
+                        next_round_opinions = {}
+                        for expert in experts:
+                            opinion_response, usage = await collect_expert_opinion_async(expert, round_num, question, answer_options, model_info)
+                            total_tokens["input"] += usage["input_tokens"]
+                            total_tokens["output"] += usage["output_tokens"]
+                            next_round_opinions[expert['role'].lower()] = opinion_response
+                        round_opinions[round_num + 1] = next_round_opinions
         
-        # PARALLEL EXECUTION: Collect final opinions from all experts
-        final_opinion_tasks = [
-            collect_final_opinion_async(expert, question, answer_options, model_info)
-            for expert in experts
-        ]
-        
-        try:
-            final_opinion_results = await asyncio.gather(*final_opinion_tasks)
-            final_opinions = {}
-            
-            for i, (final_response, usage) in enumerate(final_opinion_results):
-                expert = experts[i]
-                total_tokens["input"] += usage["input_tokens"]
-                total_tokens["output"] += usage["output_tokens"]
-                final_opinions[expert['role']] = final_response
-                
-        except Exception as e:
-            print(f"Error in parallel final opinion collection: {e}")
-            # Fallback to sequential processing
-            final_opinions = {}
-            for expert in experts:
-                final_response, usage = await collect_final_opinion_async(expert, question, answer_options, model_info)
-                total_tokens["input"] += usage["input_tokens"]
-                total_tokens["output"] += usage["output_tokens"]
-                final_opinions[expert['role']] = final_response
-        
-        # Update token usage
-        current_usage = state.get("token_usage", {"input": 0, "output": 0})
-        updated_usage = {
-            "input": current_usage["input"] + total_tokens["input"],
-            "output": current_usage["output"] + total_tokens["output"]
-        }
-        
-        return {
-            **state,
-            "interaction_log": interaction_log,
-            "round_opinions": round_opinions,
-            "final_expert_opinions": final_opinions,
-            "round_number": max_rounds,
-            "token_usage": updated_usage,
-            "processing_stage": "debate_complete"
-        }
+            # PARALLEL EXECUTION: Collect final opinions from all experts
+            final_opinion_tasks = [
+                collect_final_opinion_async(expert, question, answer_options, model_info)
+                for expert in experts
+            ]
+
+            try:
+                final_opinion_results = await asyncio.gather(*final_opinion_tasks)
+                final_opinions = {}
+
+                for i, (final_response, usage) in enumerate(final_opinion_results):
+                    expert = experts[i]
+                    total_tokens["input"] += usage["input_tokens"]
+                    total_tokens["output"] += usage["output_tokens"]
+                    final_opinions[expert['role']] = final_response
+
+            except Exception as e:
+                print(f"Error in parallel final opinion collection: {e}")
+                # Fallback to sequential processing
+                final_opinions = {}
+                for expert in experts:
+                    final_response, usage = await collect_final_opinion_async(expert, question, answer_options, model_info)
+                    total_tokens["input"] += usage["input_tokens"]
+                    total_tokens["output"] += usage["output_tokens"]
+                    final_opinions[expert['role']] = final_response
+
+            # Update token usage
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage["input"] + total_tokens["input"],
+                "output": current_usage["output"] + total_tokens["output"]
+            }
+
+            result_state = {
+                **state,
+                "interaction_log": interaction_log,
+                "round_opinions": round_opinions,
+                "final_expert_opinions": final_opinions,
+                "round_number": max_rounds,
+                "token_usage": updated_usage,
+                "processing_stage": "debate_complete"
+            }
+
+            finish_span(
+                outputs={
+                    "final_opinions": len(final_opinions),
+                    "token_usage": updated_usage,
+                }
+            )
+            return result_state
+        except Exception as exc:
+            finish_span(error=exc)
+            raise
+        finally:
+            span_ctx.__exit__(None, None, None)
     
     # Add nodes to subgraph
     subgraph.add_node("recruit_experts", recruiter.recruit_experts)

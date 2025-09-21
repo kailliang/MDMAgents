@@ -4,7 +4,7 @@ LangGraph-based MDMAgents core infrastructure.
 Real LLM implementation for production use.
 """
 
-from typing import Dict, List, Optional, Literal, Annotated, Union
+from typing import Dict, List, Optional, Literal, Annotated, Union, Any
 from typing_extensions import TypedDict
 import os
 import sys
@@ -14,6 +14,8 @@ from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
 import json
+
+from langsmith_integration import span as langsmith_span, preview_text
 
 # Import required APIs
 import google.generativeai as genai
@@ -69,23 +71,58 @@ class LangGraphAgent:
             {"role": "system", "content": str(self.instruction)},
         ]
     
-    def chat(self, message):
-        """Make real LLM API call"""
-        logger.debug(f"Input message length: {len(str(message))} characters")
-        
-        try:
-            if self.model_info in ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-lite-preview-06-17']:
-                return self._call_gemini(message)
-            elif self.model_info in ['gpt-4o-mini', 'gpt-4.1-mini']:
-                return self._call_openai(message)
-            else:
-                raise ValueError(f"Unsupported model: {self.model_info}")
-                
-        except Exception as e:
-            logger.error(f"LLM call failed - Agent: {self.role}, Error: {e}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            # Return error response that can be handled gracefully
-            return f"Error: LLM call failed for {self.role}: {str(e)}"
+    def chat(self, message, parent_run: Any = None):
+        """Make real LLM API call with LangSmith tracing."""
+        prompt_text = str(message)
+        logger.debug(f"Input message length: {len(prompt_text)} characters")
+
+        prompt_preview = preview_text(prompt_text)
+        before_input = self.total_input_tokens
+        before_output = self.total_output_tokens
+
+        with langsmith_span(
+            name=f"LLM:{self.role}",
+            run_type="llm",
+            inputs={
+                "model": self.model_info,
+                "prompt_preview": prompt_preview,
+            },
+            parent=parent_run,
+        ) as (_, finish_span):
+            try:
+                if self.model_info in [
+                    'gemini-2.5-flash',
+                    'gemini-2.5-flash-lite',
+                    'gemini-2.5-flash-lite-preview-06-17',
+                ]:
+                    response_text = self._call_gemini(prompt_text)
+                elif self.model_info in ['gpt-4o-mini', 'gpt-4.1-mini']:
+                    response_text = self._call_openai(prompt_text)
+                else:
+                    raise ValueError(f"Unsupported model: {self.model_info}")
+            except Exception as exc:
+                logger.error(f"LLM call failed - Agent: {self.role}, Error: {exc}")
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                finish_span(error=exc)
+                return f"Error: LLM call failed for {self.role}: {str(exc)}"
+
+            prompt_tokens = max(0, self.total_input_tokens - before_input)
+            completion_tokens = max(0, self.total_output_tokens - before_output)
+            total_tokens = prompt_tokens + completion_tokens
+            delta_usage = {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
+            response_preview = preview_text(response_text)
+            finish_span(
+                outputs={
+                    "response_preview": response_preview,
+                    "token_usage": delta_usage,
+                },
+                usage=delta_usage,
+            )
+            return response_text
     
     def _call_gemini(self, message):
         """Call Gemini API"""
