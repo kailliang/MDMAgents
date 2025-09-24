@@ -346,6 +346,7 @@ class ExpertAnalysisNode:
                 "options_count": len(answer_options or []),
             },
             parent=analysis_parent,
+            require_parent=analysis_parent is not None,
         ) as (analysis_run, finish_span):
             response, token_usage = self._call_llm_with_retry(
                 expert_prompt,
@@ -836,6 +837,10 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
                     "input": baseline_usage.get("input", 0),
                     "output": baseline_usage.get("output", 0),
                 }
+                span_usage_delta = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                }
 
                 for result_update in results:
                     responses = result_update.get("expert_responses", [])
@@ -846,14 +851,20 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
                     if usage_update:
                         # Each expert run reports cumulative usage starting from the baseline.
                         # Convert that back into a delta before adding it to the shared totals
-                        total_token_usage["input"] += max(
+                        input_delta = max(
                             0,
-                            usage_update.get("input", 0) - baseline_usage.get("input", 0),
+                            usage_update.get("input", 0)
+                            - baseline_usage.get("input", 0),
                         )
-                        total_token_usage["output"] += max(
+                        output_delta = max(
                             0,
-                            usage_update.get("output", 0) - baseline_usage.get("output", 0),
+                            usage_update.get("output", 0)
+                            - baseline_usage.get("output", 0),
                         )
+                        total_token_usage["input"] += input_delta
+                        total_token_usage["output"] += output_delta
+                        span_usage_delta["input_tokens"] += input_delta
+                        span_usage_delta["output_tokens"] += output_delta
 
                 result_state = {
                     **state,
@@ -867,7 +878,8 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
                     outputs={
                         "responses": len(expert_responses),
                         "token_usage": total_token_usage,
-                    }
+                    },
+                    usage=span_usage_delta,
                 )
                 return result_state
 
