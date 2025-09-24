@@ -213,7 +213,7 @@ class LangGraphAgent:
 Agent = LangGraphAgent
 
 
-class MDMStateDict(TypedDict):
+class MDMStateDict(TypedDict, total=False):
     """
     State schema for MDM agent system.
     Using TypedDict for LangGraph compatibility.
@@ -227,6 +227,7 @@ class MDMStateDict(TypedDict):
     token_usage: Dict[str, int]
     processing_stage: str
     final_decision: Optional[Dict]
+    langsmith_parent_run: Any
 
 
 class MDMState:
@@ -246,7 +247,8 @@ class MDMState:
             "token_usage": {"input": 0, "output": 0},
             "processing_stage": "start",
             "final_decision": None,
-            "confidence": None
+            "confidence": None,
+            "langsmith_parent_run": None,
         }
         
         # Merge with provided kwargs

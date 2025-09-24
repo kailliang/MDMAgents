@@ -485,6 +485,7 @@ class IntegratedMDMSystem:
                     "token_usage": {"input": 0, "output": 0},
                     "processing_stage": "start",
                     "final_decision": None,
+                    "langsmith_parent_run": _app_run,
                 }
 
                 # Handle forced difficulty routing

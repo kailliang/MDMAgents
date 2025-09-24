@@ -152,6 +152,7 @@ Please return your recruitment plan in JSON format:
 
 All experts should be marked as "Independent" with equal authority. Return ONLY the JSON, no other text."""
         
+        span_parent = state.get("langsmith_parent_run")
         with langsmith_span(
             "basic.recruit_experts",
             run_type="chain",
@@ -159,11 +160,14 @@ All experts should be marked as "Independent" with equal authority. Return ONLY 
                 "question_preview": question_preview,
                 "options_count": len(answer_options or []),
             },
-        ) as (_, finish_span):
+            parent=span_parent,
+            require_parent=span_parent is not None,
+        ) as (recruit_run, finish_span):
             response, token_usage = self._call_llm_with_retry(
-                recruitment_prompt, 
+                recruitment_prompt,
                 max_attempts=3,
-                required_fields=["experts"]
+                required_fields=["experts"],
+                parent_run=recruit_run,
             )
             
             # Parse JSON response for expert recruitment
@@ -330,6 +334,8 @@ class ExpertAnalysisNode:
 - Return ONLY the JSON, no other text
 """
         
+        analysis_parent = parent_run or state.get("langsmith_parent_run")
+
         with langsmith_span(
             "basic.expert_analysis",
             run_type="chain",
@@ -339,13 +345,13 @@ class ExpertAnalysisNode:
                 "question_preview": question_preview,
                 "options_count": len(answer_options or []),
             },
-            parent=parent_run,
+            parent=analysis_parent,
         ) as (analysis_run, finish_span):
             response, token_usage = self._call_llm_with_retry(
                 expert_prompt,
                 max_attempts=3,
                 required_fields=["reasoning", "answer"],
-                parent_run=analysis_run,
+                parent_run=analysis_run or analysis_parent,
             )
             
             # Parse expert response with improved multi-layer fallback
@@ -486,10 +492,10 @@ class ArbitratorNode:
             )
         return self._agent
     
-    def _call_llm(self, prompt: str) -> tuple[str, Dict[str, int]]:
+    def _call_llm(self, prompt: str, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
         """Make LLM call and return response with token usage"""
         agent = self._get_agent()
-        response = agent.chat(prompt)
+        response = agent.chat(prompt, parent_run=parent_run)
         usage = agent.get_token_usage()
         
         # Clear conversation history after each call to prevent accumulation across questions
@@ -500,8 +506,8 @@ class ArbitratorNode:
             "output_tokens": usage["output_tokens"]
         }
     
-    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3, 
-                            required_fields: List[str] = None) -> tuple[str, Dict[str, int]]:
+    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3,
+                            required_fields: List[str] = None, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
         """Call LLM with retry on parse failures"""
         total_usage = {"input_tokens": 0, "output_tokens": 0}
         
@@ -517,7 +523,7 @@ class ArbitratorNode:
                     "Return ONLY the JSON object. Do not include any text before or after the JSON."
                 )
             
-            response, usage = self._call_llm(prompt)
+            response, usage = self._call_llm(prompt, parent_run=parent_run)
             total_usage["input_tokens"] += usage["input_tokens"]
             total_usage["output_tokens"] += usage["output_tokens"]
             
@@ -594,6 +600,7 @@ Analyze all expert opinions and provide your final decision in exactly this JSON
 - Return ONLY the JSON, no other text
 """
 
+        span_parent = state.get("langsmith_parent_run")
         with langsmith_span(
             "basic.arbitrator",
             run_type="chain",
@@ -601,11 +608,14 @@ Analyze all expert opinions and provide your final decision in exactly this JSON
                 "question_preview": question_preview,
                 "experts": [resp.get("role") for resp in expert_responses],
             },
-        ) as (_, finish_span):
+            parent=span_parent,
+            require_parent=span_parent is not None,
+        ) as (arbitration_run, finish_span):
             response, token_usage = self._call_llm_with_retry(
                 arbitrator_prompt,
                 max_attempts=3,
-                required_fields=["analysis", "final_answer"]
+                required_fields=["analysis", "final_answer"],
+                parent_run=arbitration_run,
             )
 
             # Parse arbitrator response with improved fallback
@@ -724,6 +734,7 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
         current_usage = state["token_usage"]
         expert_roles = [expert.get("role") for expert in experts]
         
+        span_parent = state.get("langsmith_parent_run")
         with langsmith_span(
             "basic.process_all_experts",
             run_type="chain",
@@ -731,15 +742,22 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
                 "experts": expert_roles,
                 "initial_tokens": current_usage,
             },
-        ) as (parent_run, finish_span):
+            parent=span_parent,
+            require_parent=span_parent is not None,
+        ) as (sequential_run, finish_span):
             # Process each expert
             for expert in experts:
                 expert_node = ExpertAnalysisNode(expert, model_info)
-                result = expert_node.analyze_question({
+                expert_state = {
                     **state,
                     "expert_responses": [],  # Clear for individual processing
-                    "token_usage": current_usage
-                }, parent_run=parent_run)
+                    "token_usage": current_usage,
+                    "langsmith_parent_run": sequential_run or span_parent,
+                }
+                result = expert_node.analyze_question(
+                    expert_state,
+                    parent_run=sequential_run,
+                )
                 
                 # Extract the response and update usage
                 if result.update.get("expert_responses"):
@@ -750,7 +768,8 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
                 **state,
                 "expert_responses": expert_responses,
                 "token_usage": current_usage,
-                "processing_stage": "expert_analysis_complete"
+                "processing_stage": "expert_analysis_complete",
+                "langsmith_parent_run": sequential_run or span_parent,
             }
             finish_span(
                 outputs={
@@ -774,6 +793,7 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
         experts = state.get("experts", [])
         expert_roles = [expert.get("role") for expert in experts]
 
+        span_parent = state.get("langsmith_parent_run")
         with langsmith_span(
             "basic.parallel_expert_processing",
             run_type="chain",
@@ -781,7 +801,9 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
                 "experts": expert_roles,
                 "initial_tokens": state.get("token_usage", {}),
             },
-        ) as (parent_run, finish_span):
+            parent=span_parent,
+            require_parent=span_parent is not None,
+        ) as (analysis_run, finish_span):
             if not experts:
                 result_state = {**state, "expert_responses": [], "processing_stage": "no_experts"}
                 finish_span(
@@ -794,27 +816,51 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
 
             try:
                 # Create tasks for all experts - LangGraph handles parallelization
-                tasks = [analyze_expert_task(expert, state, model_info, parent_run) for expert in experts]
+                tasks = [
+                    analyze_expert_task(
+                        expert,
+                        {**state, "langsmith_parent_run": analysis_run or span_parent},
+                        model_info,
+                        analysis_run,
+                    )
+                    for expert in experts
+                ]
 
                 # Collect results from all tasks
                 results = [task.result() for task in tasks]
 
                 # Aggregate expert responses and token usage
                 expert_responses = []
-                total_token_usage = state.get("token_usage", {"input": 0, "output": 0})
+                baseline_usage = state.get("token_usage", {"input": 0, "output": 0})
+                total_token_usage = {
+                    "input": baseline_usage.get("input", 0),
+                    "output": baseline_usage.get("output", 0),
+                }
 
                 for result_update in results:
-                    if "expert_response" in result_update:
-                        expert_responses.append(result_update["expert_response"])
-                    if "token_usage" in result_update:
-                        total_token_usage["input"] += result_update["token_usage"]["input"]
-                        total_token_usage["output"] += result_update["token_usage"]["output"]
+                    responses = result_update.get("expert_responses", [])
+                    if responses:
+                        expert_responses.extend(responses)
+
+                    usage_update = result_update.get("token_usage")
+                    if usage_update:
+                        # Each expert run reports cumulative usage starting from the baseline.
+                        # Convert that back into a delta before adding it to the shared totals
+                        total_token_usage["input"] += max(
+                            0,
+                            usage_update.get("input", 0) - baseline_usage.get("input", 0),
+                        )
+                        total_token_usage["output"] += max(
+                            0,
+                            usage_update.get("output", 0) - baseline_usage.get("output", 0),
+                        )
 
                 result_state = {
                     **state,
                     "expert_responses": expert_responses,
                     "token_usage": total_token_usage,
-                    "processing_stage": "expert_analysis_complete"
+                    "processing_stage": "expert_analysis_complete",
+                    "langsmith_parent_run": analysis_run or span_parent,
                 }
 
                 finish_span(
