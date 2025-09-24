@@ -17,7 +17,6 @@ import os
 from typing import Dict, List, Any, Optional
 from langgraph.graph import StateGraph
 from langgraph.types import Command, Send
-from langgraph.func import task
 from langgraph_mdm import LangGraphAgent, MDMStateDict
 from langsmith_integration import span as langsmith_span, preview_text
 
@@ -395,15 +394,16 @@ class ExpertAnalysisNode:
                     "answer": self._extract_answer_from_text(response)
                 }
             
-            # Update token usage and expert responses
-            current_usage = state["token_usage"]
-            updated_usage = {
-                "input": current_usage["input"] + token_usage["input_tokens"],
-                "output": current_usage["output"] + token_usage["output_tokens"]
+            # Prepare token delta so the caller can aggregate across experts safely
+            usage_delta = {
+                "input": token_usage["input_tokens"],
+                "output": token_usage["output_tokens"]
             }
-            
-            current_responses = state.get("expert_responses", [])
-            updated_responses = current_responses + [expert_response]
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+            updated_usage = {
+                "input": current_usage.get("input", 0) + usage_delta["input"],
+                "output": current_usage.get("output", 0) + usage_delta["output"]
+            }
 
             finish_span(
                 outputs={
@@ -416,8 +416,8 @@ class ExpertAnalysisNode:
             
             return Command(
                 update={
-                    "expert_responses": updated_responses,
-                    "token_usage": updated_usage
+                    "expert_responses": [expert_response],
+                    "expert_token_delta": usage_delta,
                 },
                 goto="collect_responses"
             )
@@ -724,153 +724,168 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
     recruiter = ExpertRecruitmentNode(model_info=model_info)
     arbitrator = ArbitratorNode(model_info=model_info)
     
-    # Simplified approach - process experts sequentially rather than in parallel
     def process_all_experts(state: MDMStateDict) -> Dict[str, Any]:
         """Process all experts sequentially and collect responses"""
         experts = state.get("experts", [])
-        expert_responses = []
-        current_usage = state["token_usage"]
+        expert_responses: List[Dict[str, Any]] = []
+        running_usage = state.get("token_usage", {"input": 0, "output": 0}).copy()
         expert_roles = [expert.get("role") for expert in experts]
-        
+
         span_parent = state.get("langsmith_parent_run")
         with langsmith_span(
-            "basic.process_all_experts",
+            "basic.sequential_expert_processing",
             run_type="chain",
             inputs={
                 "experts": expert_roles,
-                "initial_tokens": current_usage,
+                "initial_tokens": running_usage,
             },
             parent=span_parent,
             require_parent=span_parent is not None,
         ) as (sequential_run, finish_span):
-            # Process each expert
             for expert in experts:
                 expert_node = ExpertAnalysisNode(expert, model_info)
-                result = expert_node.analyze_question({
+                branch_state = {
                     **state,
-                    "expert_responses": [],  # Clear for individual processing
-                    "token_usage": current_usage
-                }, parent_run=sequential_run)
-                
-                # Extract the response and update usage
-                if result.update.get("expert_responses"):
-                    expert_responses.extend(result.update["expert_responses"])
-                current_usage = result.update["token_usage"]
-            
-            result_state = {
-                **state,
-                "expert_responses": expert_responses,
-                "token_usage": current_usage,
-                "processing_stage": "expert_analysis_complete"
-            }
+                    "expert_responses": [],
+                    "expert_token_delta": None,
+                    "current_expert": expert,
+                    "token_usage": running_usage,
+                }
+                result = expert_node.analyze_question(branch_state, parent_run=sequential_run)
+                update = result.update or {}
+
+                responses = update.get("expert_responses") or []
+                expert_responses.extend(responses)
+
+                delta = update.get("expert_token_delta") or {"input": 0, "output": 0}
+                running_usage = {
+                    "input": running_usage.get("input", 0) + delta.get("input", 0),
+                    "output": running_usage.get("output", 0) + delta.get("output", 0),
+                }
+
             finish_span(
                 outputs={
                     "responses": len(expert_responses),
-                    "token_usage": current_usage,
+                    "token_usage": running_usage,
                 }
             )
-            return result_state
-    
-    # Task for individual expert analysis using LangGraph's @task decorator
-    @task
-    def analyze_expert_task(expert: Dict[str, Any], state: MDMStateDict, model_info: str, parent_run: Any) -> Dict[str, Any]:
-        """Analyze a single expert using LangGraph task - runs in parallel automatically"""
-        expert_node = ExpertAnalysisNode(expert, model_info)
-        result = expert_node.analyze_question({**state, "current_expert": expert}, parent_run=parent_run)
-        return result.update
-    
-    # Parallel expert processing using LangGraph task pattern
-    def parallel_expert_processing(state: MDMStateDict) -> Dict[str, Any]:
-        """Process all experts in parallel using LangGraph @task pattern"""
+
+        return {
+            **state,
+            "expert_responses": expert_responses,
+            "expert_token_delta": None,
+            "token_usage": running_usage,
+            "processing_stage": "expert_analysis_complete",
+            "current_expert": None,
+        }
+
+    def parallel_expert_processing(state: MDMStateDict) -> Command:
+        """Dispatch expert analysis in parallel using LangGraph Send API"""
         experts = state.get("experts", [])
-        expert_roles = [expert.get("role") for expert in experts]
+        if not experts:
+            return Command(
+                update={
+                    "expert_responses": [],
+                    "expert_token_delta": None,
+                    "processing_stage": "no_experts",
+                    "current_expert": None,
+                },
+                goto="arbitrator",
+            )
+
+        try:
+            base_state = {
+                **state,
+                "expert_token_delta": None,
+                "processing_stage": "expert_analysis_pending",
+            }
+            send_commands = parallel_expert_analysis(base_state)
+            return Command(
+                update={
+                    "expert_token_delta": None,
+                    "processing_stage": "expert_analysis_pending",
+                    "current_expert": None,
+                },
+                goto=send_commands,
+            )
+        except Exception as exc:
+            print(f"Error in parallel expert analysis: {exc}")
+            fallback_state = process_all_experts(state)
+            return Command(update=fallback_state, goto="arbitrator")
+
+    def expert_analysis_node(state: MDMStateDict) -> Command:
+        """Execute expert analysis for a single expert"""
+        expert = state.get("current_expert")
+        if not expert:
+            return Command(
+                update={"expert_token_delta": None, "current_expert": None},
+                goto="collect_responses",
+            )
+
+        expert_node = ExpertAnalysisNode(expert, model_info)
+        return expert_node.analyze_question(state, parent_run=state.get("langsmith_parent_run"))
+
+    def collect_expert_responses(state: MDMStateDict) -> Command:
+        """Aggregate expert responses and advance when complete"""
+        experts = state.get("experts", [])
+        responses = state.get("expert_responses", [])
+        total_expected = len(experts)
 
         span_parent = state.get("langsmith_parent_run")
         with langsmith_span(
-            "basic.parallel_expert_processing",
+            "basic.collect_expert_responses",
             run_type="chain",
             inputs={
-                "experts": expert_roles,
-                "initial_tokens": state.get("token_usage", {}),
+                "responses_collected": len(responses),
+                "expected_responses": total_expected,
             },
             parent=span_parent,
             require_parent=span_parent is not None,
-        ) as (analysis_run, finish_span):
-            if not experts:
-                result_state = {**state, "expert_responses": [], "processing_stage": "no_experts"}
-                finish_span(
-                    outputs={
-                        "responses": 0,
-                        "token_usage": result_state.get("token_usage", {}),
-                    }
-                )
-                return result_state
-
-            try:
-                # Create tasks for all experts - LangGraph handles parallelization
-                tasks = [analyze_expert_task(expert, state, model_info, analysis_run) for expert in experts]
-
-                # Collect results from all tasks
-                results = [task.result() for task in tasks]
-
-                # Aggregate expert responses and token usage
-                expert_responses = []
-                baseline_usage = state.get("token_usage", {"input": 0, "output": 0})
-                total_token_usage = {
-                    "input": baseline_usage.get("input", 0),
-                    "output": baseline_usage.get("output", 0),
+        ) as (_collect_run, finish_span):
+            finish_span(
+                outputs={
+                    "responses": len(responses),
+                    "token_usage": state.get("token_usage", {"input": 0, "output": 0}),
                 }
+            )
 
-                for result_update in results:
-                    responses = result_update.get("expert_responses", [])
-                    if responses:
-                        expert_responses.extend(responses)
+        updated_state = {
+            **state,
+            "expert_responses": responses,
+        }
+        next_node = expert_analysis_router(updated_state)
 
-                    usage_update = result_update.get("token_usage")
-                    if usage_update:
-                        # Each expert run reports cumulative usage starting from the baseline.
-                        # Convert that back into a delta before adding it to the shared totals
-                        total_token_usage["input"] += max(
-                            0,
-                            usage_update.get("input", 0) - baseline_usage.get("input", 0),
-                        )
-                        total_token_usage["output"] += max(
-                            0,
-                            usage_update.get("output", 0) - baseline_usage.get("output", 0),
-                        )
+        updates: Dict[str, Any] = {}
+        goto: Any = ()
 
-                result_state = {
-                    **state,
-                    "expert_responses": expert_responses,
-                    "token_usage": total_token_usage,
-                    "processing_stage": "expert_analysis_complete"
-                }
+        if next_node == "arbitrator" and len(responses) >= len(experts):
+            baseline_usage = state.get("token_usage", {"input": 0, "output": 0})
+            delta_usage = state.get("expert_token_delta") or {"input": 0, "output": 0}
+            final_usage = {
+                "input": baseline_usage.get("input", 0) + delta_usage.get("input", 0),
+                "output": baseline_usage.get("output", 0) + delta_usage.get("output", 0),
+            }
+            updates = {
+                "token_usage": final_usage,
+                "expert_token_delta": None,
+                "processing_stage": "expert_analysis_complete",
+            }
+            goto = "arbitrator"
 
-                finish_span(
-                    outputs={
-                        "responses": len(expert_responses),
-                        "token_usage": total_token_usage,
-                    }
-                )
-                return result_state
-
-            except Exception as e:
-                print(f"Error in parallel expert analysis: {e}")
-                finish_span(error=e)
-                # Fallback to sequential processing
-                return process_all_experts(state)
+        return Command(update=updates, goto=goto)
     
     # Add nodes to subgraph  
     subgraph.add_node("expert_recruitment", recruiter.recruit_experts)
     subgraph.add_node("expert_analysis", parallel_expert_processing)
+    subgraph.add_node("expert_analysis_node", expert_analysis_node)
+    subgraph.add_node("collect_responses", collect_expert_responses)
     subgraph.add_node("arbitrator", arbitrator.make_final_decision)
     subgraph.add_node("basic_complete", basic_processing_placeholder)
-    
+
     # Define edges
     subgraph.add_edge("expert_recruitment", "expert_analysis")
-    subgraph.add_edge("expert_analysis", "arbitrator")
     subgraph.add_edge("arbitrator", "basic_complete")
-    
+
     # Set entry point
     subgraph.add_edge("__start__", "expert_recruitment")
     

@@ -213,7 +213,41 @@ class LangGraphAgent:
 Agent = LangGraphAgent
 
 
-class MDMStateDict(TypedDict):
+def _merge_expert_responses(
+    left: Optional[List[Dict[str, Any]]],
+    right: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Append newly produced expert responses while avoiding in-place mutation."""
+
+    if right is None:
+        return list(left or [])
+
+    merged: List[Dict[str, Any]] = list(left or [])
+    if isinstance(right, list):
+        merged.extend(right)
+    else:
+        merged.append(right)
+    return merged
+
+
+def _accumulate_token_deltas(
+    left: Optional[Dict[str, int]], right: Optional[Dict[str, int]]
+) -> Dict[str, int]:
+    """Aggregate per-expert token deltas with support for explicit reset."""
+
+    if right is None:
+        return {"input": 0, "output": 0}
+
+    result = {
+        "input": (left or {}).get("input", 0),
+        "output": (left or {}).get("output", 0),
+    }
+    result["input"] += right.get("input", 0)
+    result["output"] += right.get("output", 0)
+    return result
+
+
+class MDMStateDict(TypedDict, total=False):
     """
     State schema for MDM agent system.
     Using TypedDict for LangGraph compatibility.
@@ -224,6 +258,10 @@ class MDMStateDict(TypedDict):
     difficulty: Optional[Literal["basic", "intermediate", "advanced"]]
     confidence: Optional[float]
     agents: List[Dict]
+    experts: List[Dict[str, Any]]
+    expert_responses: Annotated[List[Dict[str, Any]], _merge_expert_responses]
+    expert_token_delta: Annotated[Dict[str, int], _accumulate_token_deltas]
+    current_expert: Optional[Dict[str, Any]]
     token_usage: Dict[str, int]
     processing_stage: str
     final_decision: Optional[Dict]
@@ -243,6 +281,10 @@ class MDMState:
         defaults = {
             "messages": [],
             "agents": [],
+            "experts": [],
+            "expert_responses": [],
+            "expert_token_delta": {"input": 0, "output": 0},
+            "current_expert": None,
             "token_usage": {"input": 0, "output": 0},
             "processing_stage": "start",
             "final_decision": None,

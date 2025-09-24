@@ -161,9 +161,10 @@ def test_expert_analysis_node():
         assert "myocardial infarction" in response["reasoning"].lower()
         assert response["answer"].startswith("A)")
         
-        # Verify token accumulation
-        assert result.update["token_usage"]["input"] == 350  # 200 + 150
-        assert result.update["token_usage"]["output"] == 185  # 100 + 85
+        # Verify token delta reporting
+        assert "token_usage" not in result.update
+        assert result.update["expert_token_delta"]["input"] == 150
+        assert result.update["expert_token_delta"]["output"] == 85
 
 def test_expert_analysis_json_parsing_fallback():
     """Test expert analysis fallback when JSON parsing fails"""
@@ -193,11 +194,14 @@ def test_expert_analysis_json_parsing_fallback():
         }
         
         result = analyzer.analyze_question(state)
-        
+
         # Should create fallback response
         expert_responses = result.update["expert_responses"]
         response = expert_responses[0]
-        
+
+        assert result.update["expert_token_delta"]["input"] == mock_usage["input_tokens"] * 3
+        assert result.update["expert_token_delta"]["output"] == mock_usage["output_tokens"] * 3
+
         assert response["expert_id"] == 2
         assert response["role"] == "Pulmonologist"
         assert "Unable to parse expert response" in response["reasoning"] or "asthma" in response["reasoning"].lower()
