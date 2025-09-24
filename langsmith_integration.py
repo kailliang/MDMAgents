@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Utility helpers for optional LangSmith tracing.
 
-This module activates LangSmith spans only when:
-- The langsmith package is installed, and
-- The ``langsmith_tracing`` (or ``LANGSMITH_TRACING``) env var is truthy, and
-- A LangSmith API key is present.
+LangSmith spans are activated when the langsmith package is installed and an
+API key is present. The ``langsmith_tracing`` (or ``LANGSMITH_TRACING``) env
+var can still be used to explicitly opt in or out of tracing.
 
 All helpers no-op when tracing is disabled so the rest of the system can
 import them unconditionally.
@@ -118,13 +117,24 @@ except Exception as exc:  # pragma: no cover - fallback when not installed
         )
 _enabled = False
 if _native_traceable and _RunTree and _wrap_openai:
-    if _is_truthy(_get_env("langsmith_tracing")):
-        if _get_env("langsmith_api_key"):
+    _tracing_flag = _get_env("langsmith_tracing")
+    _api_key = _get_env("langsmith_api_key")
+
+    if not _api_key:
+        if _is_truthy(_tracing_flag):
+            logger.warning(
+                "LangSmith tracing requested but no langsmith_api_key was provided."
+            )
+    else:
+        if _tracing_flag is None:
+            _enabled = True
+            logger.info("LangSmith tracing enabled (API key detected).")
+        elif _is_truthy(_tracing_flag):
             _enabled = True
             logger.info("LangSmith tracing enabled.")
         else:
-            logger.warning(
-                "LangSmith tracing requested but no langsmith_api_key was provided."
+            logger.info(
+                "LangSmith tracing disabled via langsmith_tracing environment flag."
             )
 
 
