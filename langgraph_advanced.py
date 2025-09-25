@@ -672,7 +672,11 @@ def process_team(state: AdvancedProcessingState, team_index: int) -> Dict[str, A
 
         assessment_data = {
             "team_name": result["team_name"],
-            "assessment": result["assessment"]
+            "assessment": result["assessment"],
+            "token_usage": {
+                "input": result["token_usage"].get("input_tokens", 0),
+                "output": result["token_usage"].get("output_tokens", 0),
+            },
         }
         formatted_result = {
             "team_results": [assessment_data],
@@ -729,12 +733,26 @@ def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
             "final_review": []
         }
 
+        team_usage_totals = {"input": 0, "output": 0}
+        has_team_usage = False
+
         for result in team_results:
             team_name = result["team_name"].lower()
             assessment_data = {
                 "team_name": result["team_name"],
-                "assessment": result["assessment"]
+                "assessment": result["assessment"],
             }
+
+            entry_usage = result.get("token_usage") or {}
+            if entry_usage:
+                normalized_entry_usage = _normalize_token_usage(entry_usage)
+                team_usage_totals["input"] += normalized_entry_usage.get("input", 0)
+                team_usage_totals["output"] += normalized_entry_usage.get("output", 0)
+                has_team_usage = True
+                assessment_data["token_usage"] = {
+                    "input": normalized_entry_usage.get("input", 0),
+                    "output": normalized_entry_usage.get("output", 0),
+                }
 
             if "initial" in team_name or "iat" in team_name:
                 assessments["initial"].append(assessment_data)
@@ -745,9 +763,17 @@ def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
 
         compiled_report = compile_assessment_report(assessments)
 
-        aggregated_usage = state.get("token_usage", {}) or {}
-        input_tokens = aggregated_usage.get("input", 0)
-        output_tokens = aggregated_usage.get("output", 0)
+        aggregated_usage = _normalize_token_usage(state.get("token_usage", {}) or {})
+
+        if aggregated_usage:
+            input_tokens = aggregated_usage.get("input", 0)
+            output_tokens = aggregated_usage.get("output", 0)
+        elif has_team_usage:
+            input_tokens = team_usage_totals["input"]
+            output_tokens = team_usage_totals["output"]
+        else:
+            input_tokens = 0
+            output_tokens = 0
         total_usage = {
             "input": input_tokens,
             "output": output_tokens,
@@ -761,13 +787,22 @@ def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
             "processing_stage": "teams_processed"
         }
 
+        span_outputs = {
+            "initial": len(assessments["initial"]),
+            "specialist": len(assessments["specialist"]),
+            "final_review": len(assessments["final_review"]),
+            "token_usage": total_usage,
+        }
+
+        if has_team_usage:
+            span_outputs["team_token_usage"] = {
+                "input": team_usage_totals["input"],
+                "output": team_usage_totals["output"],
+                "total_tokens": team_usage_totals["input"] + team_usage_totals["output"],
+            }
+
         finish_span(
-            outputs={
-                "initial": len(assessments["initial"]),
-                "specialist": len(assessments["specialist"]),
-                "final_review": len(assessments["final_review"]),
-                "token_usage": total_usage,
-            },
+            outputs=span_outputs,
             usage={
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
