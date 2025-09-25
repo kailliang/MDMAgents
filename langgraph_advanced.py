@@ -49,6 +49,100 @@ def _truncate_to_word_limit(text: str, max_words: int) -> str:
     return truncated_text + "..."
 
 
+def _clean_json_response(response: str) -> str:
+    """Clean JSON response by removing markdown and extracting JSON"""
+    response = response.strip()
+    if response.startswith('```json'):
+        response = response[7:]
+    if response.startswith('```'):
+        response = response[3:]
+    if response.endswith('```'):
+        response = response[:-3]
+
+    # Find JSON content between braces
+    start_idx = response.find('{')
+    end_idx = response.rfind('}')
+
+    if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+        response = response[start_idx:end_idx+1]
+
+    return response.strip()
+
+
+def _normalize_token_usage(usage: Dict[str, int]) -> Dict[str, int]:
+    """Normalize token usage dictionary to consistent keys"""
+    if "input_tokens" in usage:
+        return {
+            "input": usage["input_tokens"],
+            "output": usage["output_tokens"]
+        }
+    return usage  # Already normalized
+
+
+def _safe_llm_call_with_truncation(agent: LangGraphAgent, prompt: str, word_limit: int) -> tuple[str, Dict[str, int]]:
+    """Make single LLM call with smart truncation at 2x word limit if needed"""
+    # Single LLM call - no retries for word limits
+    response = agent.chat(prompt)
+    usage = _normalize_token_usage(agent.get_token_usage())
+    agent.clear_history()
+
+    # Truncate at 2x word limit if exceeded
+    if not _validate_word_count(response, word_limit):
+        truncation_limit = word_limit * 2
+        response = _truncate_to_word_limit(response, truncation_limit)
+
+    return response, usage
+
+
+def _safe_llm_call_with_json_analysis_limit(call_llm_func, prompt: str, max_analysis_words: int) -> tuple[Dict[str, Any], Dict[str, int]]:
+    """Make single LLM call with analysis truncation only if JSON parsing fails - returns parsed object"""
+    total_usage = {"input": 0, "output": 0}
+
+    # Try up to 2 times - only retry if JSON parsing fails, not for word limits
+    for attempt in range(2):
+        response, usage = call_llm_func(prompt)
+
+        # Accumulate token usage
+        total_usage["input"] += usage["input"]
+        total_usage["output"] += usage["output"]
+
+        # Check if we can parse the JSON successfully
+        try:
+            # First try direct parsing
+            parsed = json.loads(response)
+            analysis = parsed.get("analysis", "")
+        except json.JSONDecodeError:
+            # Try with JSON cleaning (handle markdown, etc.)
+            try:
+                cleaned_response = _clean_json_response(response)
+                parsed = json.loads(cleaned_response)
+                analysis = parsed.get("analysis", "")
+            except json.JSONDecodeError:
+                # If both fail, this attempt failed - continue to retry logic
+                if attempt < 1:
+                    prompt += f"\n\nIMPORTANT: Previous response was not valid JSON. Please provide a valid JSON response."
+                    continue
+                else:
+                    # Last attempt failed, return fallback object
+                    return {
+                        "analysis": "JSON parsing failed after retry",
+                        "final_answer": "X) Parsing error",
+                        "raw_response": response
+                    }, total_usage
+
+        # If analysis exceeds limit, truncate it but don't retry
+        if not _validate_word_count(analysis, max_analysis_words):
+            truncation_limit = max_analysis_words * 2
+            parsed["analysis"] = _truncate_to_word_limit(analysis, truncation_limit)
+
+        return parsed, total_usage
+
+    return {
+        "analysis": "Unexpected error in JSON processing",
+        "final_answer": "X) Processing error"
+    }, total_usage
+
+
 class AdvancedProcessingState(TypedDict, total=False):
     """Extended state for advanced processing with MDT mechanics"""
     # Core fields
@@ -76,7 +170,7 @@ class MDTFormationNode:
     def __init__(self, model_info: str = "gemini-2.5-flash"):
         self.model_info = model_info
         self._agent = None
-    
+
     def _get_agent(self) -> LangGraphAgent:
         """Get or create the MDT formation agent"""
         if self._agent is None:
@@ -86,19 +180,19 @@ class MDTFormationNode:
                 model_info=self.model_info
             )
         return self._agent
-    
+
     def _call_llm(self, prompt: str) -> tuple[str, Dict[str, int]]:
         """Make LLM call and return response with token usage"""
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
-        
+
         # Clear conversation history after each call to prevent accumulation across questions
         agent.clear_history()
-        
+
         return response, {
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"]
+            "input": usage["input_tokens"],
+            "output": usage["output_tokens"]
         }
     
     def form_teams(self, state: AdvancedProcessingState) -> Command:
@@ -164,21 +258,23 @@ Return only valid JSON without markdown code blocks."""
             
             # Parse MDT response
             try:
-                cleaned_response = self._clean_json_response(response)
+                cleaned_response = _clean_json_response(response)
                 mdt_data = json.loads(cleaned_response)
                 teams = mdt_data.get('teams', [])
                 
                 if len(teams) != num_teams:
                     raise ValueError(f"Expected {num_teams} teams, got {len(teams)}")
                     
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError) as e:
+                # Log fallback usage for monitoring
+                print(f"Warning: MDT formation parsing failed, using default teams. Error: {e}")
                 teams = self._create_default_teams()
             
             # Update token usage
             current_usage = state.get("token_usage", {"input": 0, "output": 0})
             updated_usage = {
-                "input": current_usage["input"] + token_usage["input_tokens"],
-                "output": current_usage["output"] + token_usage["output_tokens"]
+                "input": current_usage["input"] + token_usage["input"],
+                "output": current_usage["output"] + token_usage["output"]
             }
 
             finish_span(
@@ -197,26 +293,7 @@ Return only valid JSON without markdown code blocks."""
                 },
                 goto="categorize_teams"
             )
-    
-    def _clean_json_response(self, response: str) -> str:
-        """Clean JSON response by removing markdown and extracting JSON"""
-        response = response.strip()
-        if response.startswith('```json'):
-            response = response[7:]
-        if response.startswith('```'):
-            response = response[3:]
-        if response.endswith('```'):
-            response = response[:-3]
-        
-        # Find JSON content between braces
-        start_idx = response.find('{')
-        end_idx = response.rfind('}')
-        
-        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-            response = response[start_idx:end_idx+1]
-        
-        return response.strip()
-    
+
     def _create_default_teams(self) -> List[Dict]:
         """Create default MDT structure when parsing fails"""
         return [
@@ -253,11 +330,11 @@ Return only valid JSON without markdown code blocks."""
 
 class OverallCoordinatorNode:
     """Node for overall coordinator synthesis"""
-    
+
     def __init__(self, model_info: str = "gemini-2.5-flash"):
         self.model_info = model_info
         self._agent = None
-    
+
     def _get_agent(self) -> LangGraphAgent:
         """Get or create the coordinator agent"""
         if self._agent is None:
@@ -267,19 +344,19 @@ class OverallCoordinatorNode:
                 model_info=self.model_info
             )
         return self._agent
-    
+
     def _call_llm(self, prompt: str) -> tuple[str, Dict[str, int]]:
         """Make LLM call and return response with token usage"""
         agent = self._get_agent()
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
-        
+
         # Clear conversation history after each call to prevent accumulation across questions
         agent.clear_history()
-        
+
         return response, {
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"]
+            "input": usage["input_tokens"],
+            "output": usage["output_tokens"]
         }
     
     def coordinate_decision(self, state: AdvancedProcessingState) -> Command:
@@ -323,22 +400,13 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
                 "question_preview": question_preview,
             },
         ) as (_, finish_span):
-            # Call with word limit validation for analysis (150 words)
-            response, token_usage = self._call_llm_with_analysis_limit(coordinator_prompt, 150)
-
-            try:
-                coordinator_decision = self._parse_coordinator_json(response)
-            except json.JSONDecodeError:
-                coordinator_decision = {
-                    "analysis": "JSON parsing error in coordinator response",
-                    "final_answer": "X) Parsing error",
-                    "raw_response": response
-                }
+            # Call with word limit validation for analysis (150 words) - returns parsed object
+            coordinator_decision, token_usage = self._call_llm_with_analysis_limit(coordinator_prompt, 150)
             
             current_usage = state.get("token_usage", {"input": 0, "output": 0})
             updated_usage = {
-                "input": current_usage["input"] + token_usage["input_tokens"],
-                "output": current_usage["output"] + token_usage["output_tokens"]
+                "input": current_usage["input"] + token_usage["input"],
+                "output": current_usage["output"] + token_usage["output"]
             }
 
             finish_span(
@@ -368,7 +436,7 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
             pass
 
         # Clean and try again
-        cleaned_response = self._clean_json_response(response)
+        cleaned_response = _clean_json_response(response)
         try:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
@@ -418,51 +486,9 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
 
         return "X) Unable to extract answer"
 
-    def _clean_json_response(self, response: str) -> str:
-        """Clean JSON response by removing markdown and extracting JSON"""
-        response = response.strip()
-        if response.startswith('```json'):
-            response = response[7:]
-        if response.startswith('```'):
-            response = response[3:]
-        if response.endswith('```'):
-            response = response[:-3]
-
-        # Find JSON content between braces
-        start_idx = response.find('{')
-        end_idx = response.rfind('}')
-
-        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-            response = response[start_idx:end_idx+1]
-
-        return response.strip()
-
-    def _call_llm_with_analysis_limit(self, prompt: str, max_analysis_words: int) -> tuple[str, Dict[str, int]]:
-        """Make LLM call with analysis word count validation and retry logic"""
-        total_usage = {"input_tokens": 0, "output_tokens": 0}
-
-        for attempt in range(3):  # Allow 2 retries
-            response, usage = self._call_llm(prompt)
-
-            # Accumulate token usage
-            total_usage["input_tokens"] += usage["input_tokens"]
-            total_usage["output_tokens"] += usage["output_tokens"]
-
-            # Check if analysis section meets word limit
-            try:
-                parsed = json.loads(response)
-                analysis = parsed.get("analysis", "")
-                if _validate_word_count(analysis, max_analysis_words):
-                    return response, total_usage
-            except json.JSONDecodeError:
-                # If not valid JSON, check the entire response
-                if _validate_word_count(response, max_analysis_words + 20):  # Allow some extra for JSON structure
-                    return response, total_usage
-
-            if attempt < 2:
-                prompt += f"\n\nIMPORTANT: Previous analysis exceeded {max_analysis_words} words. Please provide a shorter analysis within the word limit."
-
-        return response, total_usage  # Return last attempt even if it exceeds limit
+    def _call_llm_with_analysis_limit(self, prompt: str, max_analysis_words: int) -> tuple[Dict[str, Any], Dict[str, int]]:
+        """Make LLM call with smart JSON analysis truncation - returns parsed object"""
+        return _safe_llm_call_with_json_analysis_limit(self._call_llm, prompt, max_analysis_words)
 
 
 # Team processing functions for LangGraph native parallelization
@@ -499,20 +525,10 @@ As the team lead with your medical expertise, provide your professional assessme
 
 **CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
 
-    # Call with word limit validation (100 words)
-    for attempt in range(3):  # Allow 2 retries
-        lead_investigation = lead_agent.chat(lead_investigation_prompt)
-        lead_investigation_usage = lead_agent.get_token_usage()
-        lead_agent.clear_history()
-
-        if _validate_word_count(lead_investigation, 100):
-            break
-
-        if attempt < 2:
-            lead_investigation_prompt += f"\n\nIMPORTANT: Previous response exceeded 100 words ({len(lead_investigation.split())} words). Please provide a shorter response within the 100-word limit."
-        else:
-            # Final fallback: truncate
-            lead_investigation = _truncate_to_word_limit(lead_investigation, 100)
+    # Single LLM call with smart truncation (100 words, max 200)
+    lead_investigation, lead_investigation_usage = _safe_llm_call_with_truncation(
+        lead_agent, lead_investigation_prompt, 100
+    )
     
     # STEP 2: Assistant investigations (100 words each) 
     investigations = []
@@ -549,33 +565,24 @@ Based on synthesizing all team member investigations above, determine which opti
 
 **CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
     
-    # Call with word limit validation (100 words)
-    for attempt in range(3):  # Allow 2 retries
-        team_assessment = lead_agent.chat(synthesis_prompt)
-        lead_synthesis_usage = lead_agent.get_token_usage()
-        lead_agent.clear_history()
-
-        if _validate_word_count(team_assessment, 100):
-            break
-
-        if attempt < 2:
-            synthesis_prompt += f"\n\nIMPORTANT: Previous response exceeded 100 words ({len(team_assessment.split())} words). Please provide a shorter response within the 100-word limit."
-        else:
-            # Final fallback: truncate
-            team_assessment = _truncate_to_word_limit(team_assessment, 100)
+    # Single LLM call with smart truncation (100 words, max 200)
+    team_assessment, lead_synthesis_usage = _safe_llm_call_with_truncation(
+        lead_agent, synthesis_prompt, 100
+    )
     
     # Calculate total token usage for this team (lead investigation + synthesis + assistants)
     total_tokens = {
-        "input_tokens": lead_investigation_usage["input_tokens"] + lead_synthesis_usage["input_tokens"],
-        "output_tokens": lead_investigation_usage["output_tokens"] + lead_synthesis_usage["output_tokens"]
+        "input_tokens": lead_investigation_usage["input"] + lead_synthesis_usage["input"],
+        "output_tokens": lead_investigation_usage["output"] + lead_synthesis_usage["output"]
     }
-    
+
     # Add assistant token usage
     for investigation_item in investigations:
         if len(investigation_item) >= 3:  # (role, investigation, usage)
             _, _, assistant_usage = investigation_item
-            total_tokens["input_tokens"] += assistant_usage["input_tokens"]
-            total_tokens["output_tokens"] += assistant_usage["output_tokens"]
+            normalized_assistant_usage = _normalize_token_usage(assistant_usage)
+            total_tokens["input_tokens"] += normalized_assistant_usage["input"]
+            total_tokens["output_tokens"] += normalized_assistant_usage["output"]
     
     return {
         "team_name": team_name,
@@ -589,20 +596,26 @@ Based on synthesizing all team member investigations above, determine which opti
 
 def gather_member_investigations_sync(members: List[Dict], team_goal: str,
                                      question: str, answer_options: List[str], model_info: str) -> List[tuple]:
-    """Gather investigations from assistant members - parallel investigation"""
-    
+    """Gather investigations from assistant members - sequential processing with agent pooling"""
+
+    # Pool agents by role to avoid repeated instantiation
+    agent_pool = {}
     investigations = []
+
     for member in members:
         role = member.get("role", "team member")
         expertise = member.get("expertise_description", "medical expertise")
-        
-        # Create member agent
-        member_agent = LangGraphAgent(
-            instruction=f"You are a {role} who {expertise.lower()}.",
-            role=role.lower(),
-            model_info=model_info
-        )
-        
+
+        # Reuse agent if already created for this role, otherwise create new one
+        if role not in agent_pool:
+            agent_pool[role] = LangGraphAgent(
+                instruction=f"You are a {role} who {expertise.lower()}.",
+                role=role.lower(),
+                model_info=model_info
+            )
+
+        member_agent = agent_pool[role]
+
         # Direct investigation prompt - no lead dependency
         options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
 
@@ -616,48 +629,36 @@ Answer Options:
 Based on your expertise as a {role}, provide your medical assessment of this case. Focus on determining the correct answer from the options above.
 
 **CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
-        
-        # Call with word limit validation (100 words)
-        for attempt in range(3):  # Allow 2 retries
-            investigation = member_agent.chat(investigation_prompt)
-            usage = member_agent.get_token_usage()
-            member_agent.clear_history()
 
-            if _validate_word_count(investigation, 100):
-                break
-
-            if attempt < 2:
-                investigation_prompt += f"\n\nIMPORTANT: Previous response exceeded 100 words ({len(investigation.split())} words). Please provide a shorter response within the 100-word limit."
-            else:
-                # Final fallback: truncate
-                investigation = _truncate_to_word_limit(investigation, 100)
+        # Single LLM call with smart truncation (100 words, max 200)
+        investigation, usage = _safe_llm_call_with_truncation(member_agent, investigation_prompt, 100)
 
         investigations.append((role, investigation, usage))
-    
+
     return investigations
 
 
 # Individual team processing nodes for LangGraph native parallelization
 
-def process_team_1(state: AdvancedProcessingState) -> Dict[str, Any]:
-    """Process first team in parallel"""
+def process_team(state: AdvancedProcessingState, team_index: int) -> Dict[str, Any]:
+    """Process team by index in parallel"""
     teams = state.get("mdt_teams", [])
-    team = teams[0] if len(teams) >= 1 else None
+    team = teams[team_index] if len(teams) > team_index else None
 
     with langsmith_span(
         "advanced.process_team",
         run_type="chain",
         inputs={
-            "team_index": 1,
+            "team_index": team_index + 1,  # Display 1-based for humans
             "team_name": team.get("team_name") if team else None,
         },
     ) as (_, finish_span):
         if team is None:
             fallback = {
                 "team_results": [{
-                    "team_name": "Error Team 1",
+                    "team_name": f"Error Team {team_index + 1}",
                     "assessment": "No team data",
-                    "token_usage": {"input_tokens": 0, "output_tokens": 0}
+                    "token_usage": {"input": 0, "output": 0}
                 }]
             }
             finish_span(outputs={"fallback": True})
@@ -676,8 +677,8 @@ def process_team_1(state: AdvancedProcessingState) -> Dict[str, Any]:
         formatted_result = {
             "team_results": [assessment_data],
             "token_usage": {
-                "input_tokens": result["token_usage"]["input_tokens"],
-                "output_tokens": result["token_usage"]["output_tokens"]
+                "input": result["token_usage"]["input_tokens"],
+                "output": result["token_usage"]["output_tokens"]
             }
         }
 
@@ -694,120 +695,21 @@ def process_team_1(state: AdvancedProcessingState) -> Dict[str, Any]:
         )
 
         return formatted_result
+
+
+def process_team_1(state: AdvancedProcessingState) -> Dict[str, Any]:
+    """Process first team in parallel"""
+    return process_team(state, 0)
 
 
 def process_team_2(state: AdvancedProcessingState) -> Dict[str, Any]:
     """Process second team in parallel"""
-    teams = state.get("mdt_teams", [])
-    team = teams[1] if len(teams) >= 2 else None
-
-    with langsmith_span(
-        "advanced.process_team",
-        run_type="chain",
-        inputs={
-            "team_index": 2,
-            "team_name": team.get("team_name") if team else None,
-        },
-    ) as (_, finish_span):
-        if team is None:
-            fallback = {
-                "team_results": [{
-                    "team_name": "Error Team 2",
-                    "assessment": "No team data",
-                    "token_usage": {"input_tokens": 0, "output_tokens": 0}
-                }]
-            }
-            finish_span(outputs={"fallback": True})
-            return fallback
-
-        question = state["question"]
-        answer_options = state.get("answer_options", [])
-        model_info = state.get('_model_info', 'gemini-2.5-flash')
-
-        result = process_single_team(team, question, answer_options, model_info)
-
-        assessment_data = {
-            "team_name": result["team_name"],
-            "assessment": result["assessment"]
-        }
-        formatted_result = {
-            "team_results": [assessment_data],
-            "token_usage": {
-                "input_tokens": result["token_usage"]["input_tokens"],
-                "output_tokens": result["token_usage"]["output_tokens"]
-            }
-        }
-
-        finish_span(
-            outputs={
-                "team_name": result["team_name"],
-                "token_usage": formatted_result["token_usage"],
-            },
-            usage={
-                "input_tokens": result["token_usage"].get("input_tokens", 0),
-                "output_tokens": result["token_usage"].get("output_tokens", 0),
-                "total_tokens": result["token_usage"].get("input_tokens", 0) + result["token_usage"].get("output_tokens", 0),
-            },
-        )
-
-        return formatted_result
+    return process_team(state, 1)
 
 
 def process_team_3(state: AdvancedProcessingState) -> Dict[str, Any]:
     """Process third team in parallel"""
-    teams = state.get("mdt_teams", [])
-    team = teams[2] if len(teams) >= 3 else None
-
-    with langsmith_span(
-        "advanced.process_team",
-        run_type="chain",
-        inputs={
-            "team_index": 3,
-            "team_name": team.get("team_name") if team else None,
-        },
-    ) as (_, finish_span):
-        if team is None:
-            fallback = {
-                "team_results": [{
-                    "team_name": "Error Team 3",
-                    "assessment": "No team data",
-                    "token_usage": {"input_tokens": 0, "output_tokens": 0}
-                }]
-            }
-            finish_span(outputs={"fallback": True})
-            return fallback
-
-        question = state["question"]
-        answer_options = state.get("answer_options", [])
-        model_info = state.get('_model_info', 'gemini-2.5-flash')
-
-        result = process_single_team(team, question, answer_options, model_info)
-
-        assessment_data = {
-            "team_name": result["team_name"],
-            "assessment": result["assessment"]
-        }
-        formatted_result = {
-            "team_results": [assessment_data],
-            "token_usage": {
-                "input_tokens": result["token_usage"]["input_tokens"],
-                "output_tokens": result["token_usage"]["output_tokens"]
-            }
-        }
-
-        finish_span(
-            outputs={
-                "team_name": result["team_name"],
-                "token_usage": formatted_result["token_usage"],
-            },
-            usage={
-                "input_tokens": result["token_usage"].get("input_tokens", 0),
-                "output_tokens": result["token_usage"].get("output_tokens", 0),
-                "total_tokens": result["token_usage"].get("input_tokens", 0) + result["token_usage"].get("output_tokens", 0),
-            },
-        )
-
-        return formatted_result
+    return process_team(state, 2)
 
 
 def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
@@ -843,14 +745,15 @@ def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
 
         compiled_report = compile_assessment_report(assessments)
         total_usage = {
-            "input_tokens": sum(result.get("token_usage", {}).get("input_tokens", 0) for result in team_results),
-            "output_tokens": sum(result.get("token_usage", {}).get("output_tokens", 0) for result in team_results),
+            "input": sum(result.get("token_usage", {}).get("input", 0) for result in team_results),
+            "output": sum(result.get("token_usage", {}).get("output", 0) for result in team_results),
         }
-        total_usage["total_tokens"] = total_usage["input_tokens"] + total_usage["output_tokens"]
+        total_usage["total_tokens"] = total_usage["input"] + total_usage["output"]
 
         result_state = {
             "team_assessments": assessments,
             "compiled_report": compiled_report,
+            "token_usage": total_usage,
             "processing_stage": "teams_processed"
         }
 
@@ -915,41 +818,23 @@ def compile_assessment_report(assessments: Dict[str, List[Dict]]) -> str:
     for assessment in assessments.get("initial", []):
         team_name = assessment.get("team_name", "Unknown Team")
         content = assessment.get("assessment", "No assessment available")
-        # Extract team number from team_name or use fallback
-        team_number = _extract_team_number(team_name)
-        report += f"Team {team_number} - {team_name}:\n{content}\n\n"
+        report += f"{team_name}:\n{content}\n\n"
 
     # Specialist assessments
     report += "[Specialist Team Assessments]\n"
     for assessment in assessments.get("specialist", []):
         team_name = assessment.get("team_name", "Unknown Team")
         content = assessment.get("assessment", "No assessment available")
-        team_number = _extract_team_number(team_name)
-        report += f"Team {team_number} - {team_name}:\n{content}\n\n"
+        report += f"{team_name}:\n{content}\n\n"
 
     # Final review assessments
     report += "[Final Review Team Decisions]\n"
     for assessment in assessments.get("final_review", []):
         team_name = assessment.get("team_name", "Unknown Team")
         content = assessment.get("assessment", "No assessment available")
-        team_number = _extract_team_number(team_name)
-        report += f"Team {team_number} - {team_name}:\n{content}\n\n"
+        report += f"{team_name}:\n{content}\n\n"
 
     return report
-
-
-def _extract_team_number(team_name: str) -> int:
-    """Extract team number from team name for consistent numbering"""
-    team_name_lower = team_name.lower()
-
-    # Map team names to their original numbers
-    if "initial" in team_name_lower or "iat" in team_name_lower:
-        return 1
-    elif "final" in team_name_lower or "review" in team_name_lower or "frdt" in team_name_lower:
-        return 3
-    else:
-        # Specialist or any other team gets number 2
-        return 2
 
 
 
