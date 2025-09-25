@@ -744,11 +744,15 @@ def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
                 assessments["specialist"].append(assessment_data)
 
         compiled_report = compile_assessment_report(assessments)
+
+        aggregated_usage = state.get("token_usage", {}) or {}
+        input_tokens = aggregated_usage.get("input", 0)
+        output_tokens = aggregated_usage.get("output", 0)
         total_usage = {
-            "input": sum(result.get("token_usage", {}).get("input", 0) for result in team_results),
-            "output": sum(result.get("token_usage", {}).get("output", 0) for result in team_results),
+            "input": input_tokens,
+            "output": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
         }
-        total_usage["total_tokens"] = total_usage["input"] + total_usage["output"]
 
         result_state = {
             "team_assessments": assessments,
@@ -764,7 +768,11 @@ def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
                 "final_review": len(assessments["final_review"]),
                 "token_usage": total_usage,
             },
-            usage=total_usage,
+            usage={
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
         )
 
         return result_state
