@@ -79,11 +79,37 @@ def _normalize_token_usage(usage: Dict[str, int]) -> Dict[str, int]:
     return usage  # Already normalized
 
 
+def _get_normalized_usage(agent: LangGraphAgent) -> Dict[str, int]:
+    """Fetch and normalize token usage from an agent with safe defaults."""
+    if not hasattr(agent, "get_token_usage"):
+        return {"input": 0, "output": 0}
+
+    raw_usage = agent.get_token_usage() or {}
+    normalized = _normalize_token_usage(raw_usage)
+    return {
+        "input": normalized.get("input", 0),
+        "output": normalized.get("output", 0),
+    }
+
+
+def _calculate_usage_delta(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
+    """Calculate the delta token usage between two measurements."""
+    delta_input = max(0, after.get("input", 0) - before.get("input", 0))
+    delta_output = max(0, after.get("output", 0) - before.get("output", 0))
+    return {
+        "input": delta_input,
+        "output": delta_output,
+        "total_tokens": delta_input + delta_output,
+    }
+
+
 def _safe_llm_call_with_truncation(agent: LangGraphAgent, prompt: str, word_limit: int) -> tuple[str, Dict[str, int]]:
     """Make single LLM call with smart truncation at 2x word limit if needed"""
     # Single LLM call - no retries for word limits
+    before_usage = _get_normalized_usage(agent)
     response = agent.chat(prompt)
-    usage = _normalize_token_usage(agent.get_token_usage())
+    after_usage = _get_normalized_usage(agent)
+    usage_delta = _calculate_usage_delta(before_usage, after_usage)
     agent.clear_history()
 
     # Truncate at 2x word limit if exceeded
@@ -91,20 +117,25 @@ def _safe_llm_call_with_truncation(agent: LangGraphAgent, prompt: str, word_limi
         truncation_limit = word_limit * 2
         response = _truncate_to_word_limit(response, truncation_limit)
 
-    return response, usage
+    return response, usage_delta
 
 
-def _safe_llm_call_with_json_analysis_limit(call_llm_func, prompt: str, max_analysis_words: int) -> tuple[Dict[str, Any], Dict[str, int]]:
+def _safe_llm_call_with_json_analysis_limit(agent: LangGraphAgent, prompt: str, max_analysis_words: int) -> tuple[Dict[str, Any], Dict[str, int]]:
     """Make single LLM call with analysis truncation only if JSON parsing fails - returns parsed object"""
-    total_usage = {"input": 0, "output": 0}
+    total_usage = {"input": 0, "output": 0, "total_tokens": 0}
 
     # Try up to 2 times - only retry if JSON parsing fails, not for word limits
     for attempt in range(2):
-        response, usage = call_llm_func(prompt)
+        before_usage = _get_normalized_usage(agent)
+        response = agent.chat(prompt)
+        after_usage = _get_normalized_usage(agent)
+        usage_delta = _calculate_usage_delta(before_usage, after_usage)
+        agent.clear_history()
 
-        # Accumulate token usage
-        total_usage["input"] += usage["input"]
-        total_usage["output"] += usage["output"]
+        # Accumulate token usage deltas
+        total_usage["input"] += usage_delta["input"]
+        total_usage["output"] += usage_delta["output"]
+        total_usage["total_tokens"] = total_usage["input"] + total_usage["output"]
 
         # Check if we can parse the JSON successfully
         try:
@@ -184,15 +215,19 @@ class MDTFormationNode:
     def _call_llm(self, prompt: str) -> tuple[str, Dict[str, int]]:
         """Make LLM call and return response with token usage"""
         agent = self._get_agent()
+        before_usage = _get_normalized_usage(agent)
         response = agent.chat(prompt)
-        usage = agent.get_token_usage()
+        after_usage = _get_normalized_usage(agent)
 
         # Clear conversation history after each call to prevent accumulation across questions
         agent.clear_history()
 
+        usage_delta = _calculate_usage_delta(before_usage, after_usage)
+
         return response, {
-            "input": usage["input_tokens"],
-            "output": usage["output_tokens"]
+            "input": usage_delta["input"],
+            "output": usage_delta["output"],
+            "total_tokens": usage_delta["total_tokens"],
         }
     
     def form_teams(self, state: AdvancedProcessingState) -> Command:
@@ -274,8 +309,9 @@ Return only valid JSON without markdown code blocks."""
             current_usage = state.get("token_usage", {"input": 0, "output": 0})
             updated_usage = {
                 "input": current_usage["input"] + token_usage["input"],
-                "output": current_usage["output"] + token_usage["output"]
+                "output": current_usage["output"] + token_usage["output"],
             }
+            updated_usage["total_tokens"] = updated_usage["input"] + updated_usage["output"]
 
             finish_span(
                 outputs={
@@ -348,15 +384,19 @@ class OverallCoordinatorNode:
     def _call_llm(self, prompt: str) -> tuple[str, Dict[str, int]]:
         """Make LLM call and return response with token usage"""
         agent = self._get_agent()
+        before_usage = _get_normalized_usage(agent)
         response = agent.chat(prompt)
-        usage = agent.get_token_usage()
+        after_usage = _get_normalized_usage(agent)
 
         # Clear conversation history after each call to prevent accumulation across questions
         agent.clear_history()
 
+        usage_delta = _calculate_usage_delta(before_usage, after_usage)
+
         return response, {
-            "input": usage["input_tokens"],
-            "output": usage["output_tokens"]
+            "input": usage_delta["input"],
+            "output": usage_delta["output"],
+            "total_tokens": usage_delta["total_tokens"],
         }
     
     def coordinate_decision(self, state: AdvancedProcessingState) -> Command:
@@ -406,8 +446,9 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
             current_usage = state.get("token_usage", {"input": 0, "output": 0})
             updated_usage = {
                 "input": current_usage["input"] + token_usage["input"],
-                "output": current_usage["output"] + token_usage["output"]
+                "output": current_usage["output"] + token_usage["output"],
             }
+            updated_usage["total_tokens"] = updated_usage["input"] + updated_usage["output"]
 
             finish_span(
                 outputs={
@@ -488,7 +529,8 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
 
     def _call_llm_with_analysis_limit(self, prompt: str, max_analysis_words: int) -> tuple[Dict[str, Any], Dict[str, int]]:
         """Make LLM call with smart JSON analysis truncation - returns parsed object"""
-        return _safe_llm_call_with_json_analysis_limit(self._call_llm, prompt, max_analysis_words)
+        agent = self._get_agent()
+        return _safe_llm_call_with_json_analysis_limit(agent, prompt, max_analysis_words)
 
 
 # Team processing functions for LangGraph native parallelization
@@ -678,9 +720,12 @@ def process_team(state: AdvancedProcessingState, team_index: int) -> Dict[str, A
             "team_results": [assessment_data],
             "token_usage": {
                 "input": result["token_usage"]["input_tokens"],
-                "output": result["token_usage"]["output_tokens"]
+                "output": result["token_usage"]["output_tokens"],
             }
         }
+        formatted_result["token_usage"]["total_tokens"] = (
+            formatted_result["token_usage"]["input"] + formatted_result["token_usage"]["output"]
+        )
 
         finish_span(
             outputs={
