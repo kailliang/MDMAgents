@@ -7,8 +7,6 @@ Implements the high-performance 3-expert + arbitrator system:
 2. Independent Expert Analysis - parallel processing with JSON responses
 3. Arbitrator Decision - synthesis of expert opinions into final decision
 
-Target: 87%+ accuracy with token efficiency
-Based on existing process_basic_query function in utils.py:540+
 """
 
 import json
@@ -319,7 +317,7 @@ class ExpertAnalysisNode:
         expert_prompt = f"""You are a {expert['role']}. Analyze the following multiple choice question and provide your response in exactly this JSON format:
 
 {{
-  "reasoning": "Your step-by-step medical analysis in no more than 300 words",
+  "reasoning": "Your step-by-step medical analysis in no more than 100 words",
   "answer": "X) Example Answer"
 }}
 
@@ -588,7 +586,7 @@ Question: {question}
 Analyze all expert opinions and provide your final decision in exactly this JSON format:
 
 {{
-  "analysis": "Your analysis of the expert opinions and rationale for final decision in no more than 300 words",
+  "analysis": "Your analysis of the expert opinions and rationale for final decision in no more than 150 words",
   "final_answer": "X) Example Answer"
 }}
 

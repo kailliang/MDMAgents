@@ -17,6 +17,10 @@ import json
 
 from langsmith_integration import span as langsmith_span, preview_text
 
+# Reduce gRPC noise on non-GCP hosts and prefer REST transport for Gemini
+os.environ.setdefault("GOOGLE_CLOUD_DISABLE_GRPC", "true")
+os.environ.setdefault("GRPC_ALTS_ENABLED", "0")
+
 # Import required APIs
 import google.generativeai as genai
 from openai import OpenAI
