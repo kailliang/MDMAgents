@@ -10,6 +10,7 @@ import os
 import sys
 import traceback
 import logging
+import warnings
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
@@ -17,13 +18,21 @@ import json
 
 from langsmith_integration import span as langsmith_span, preview_text
 
-# Reduce gRPC noise on non-GCP hosts and prefer REST transport for Gemini
+# Enhanced gRPC/ALTS warning suppression for non-GCP environments
 os.environ.setdefault("GOOGLE_CLOUD_DISABLE_GRPC", "true")
 os.environ.setdefault("GRPC_ALTS_ENABLED", "0")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("GRPC_TRACE", "")
 
 # Import required APIs
 import google.generativeai as genai
 from openai import OpenAI
+
+# Suppress specific gRPC/ALTS warnings programmatically
+warnings.filterwarnings("ignore", message=".*ALTS.*")
+warnings.filterwarnings("ignore", message=".*alts.*")
+logging.getLogger("grpc").setLevel(logging.ERROR)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -55,7 +64,7 @@ class LangGraphAgent:
         """Initialize Gemini model"""
         if 'genai_api_key' in os.environ:
             logger.debug(f"Configuring Gemini API for {self.role}")
-            genai.configure(api_key=os.environ['genai_api_key'])
+            genai.configure(api_key=os.environ['genai_api_key'], transport='rest')
             self.model = genai.GenerativeModel(self.model_info)
             self._chat = self.model.start_chat(history=[])
         else:

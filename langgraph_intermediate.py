@@ -5,7 +5,7 @@ LangGraph implementation of the Intermediate Processing Graph for MDMAgents.
 Pipeline requirements implemented:
 1. Recruit three domain experts that match the problem needs.
 2. Gather initial structured responses from each expert.
-3. Run up to three structured debate rounds with full information sharing.
+3. If consensus exists, complete immediately; otherwise run up to three structured debate rounds.
 4. Resolve with a moderator who either acknowledges consensus or delivers a ruling.
 
 Outputs:
@@ -19,12 +19,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Annotated
+from typing import Any, Dict, List, Optional, Tuple, Annotated, TypedDict
 
 from langgraph.graph import StateGraph
 from langgraph.types import Command
-
-from typing_extensions import TypedDict
 
 from langgraph_mdm import LangGraphAgent, _merge_expert_responses
 from langsmith_integration import preview_text, span as langsmith_span
@@ -80,14 +78,7 @@ def _clean_json_text(response: str) -> str:
     return text.strip()
 
 
-def _merge_usage(state: IntermediateProcessingState, delta: UsageDelta) -> Dict[str, int]:
-    """Update the state's cumulative token usage with a new delta."""
-
-    current = state.get("token_usage", {"input": 0, "output": 0})
-    return {
-        "input": current.get("input", 0) + delta.input_tokens,
-        "output": current.get("output", 0) + delta.output_tokens,
-    }
+# _merge_usage function removed - now using Annotated reducers for token tracking
 
 
 def _parse_json_response(response: str) -> Dict[str, Any]:
@@ -233,12 +224,9 @@ Return only the JSON object.
                     )
                 ]
 
-            token_usage = _merge_usage(state, usage)
-
             finish_span(
                 outputs={
                     "experts": [exp.get("role") for exp in experts],
-                    "token_usage": token_usage,
                 },
                 usage=usage.as_dict(),
             )
@@ -333,13 +321,11 @@ Provide your initial answer and reasoning. Respect the following rules:
                 )
 
             consensus, answer = _check_consensus_from_list(responses_list)
-            token_usage = _merge_usage(state, cumulative_usage)
 
             finish_span(
                 outputs={
                     "consensus": consensus,
                     "answer": answer,
-                    "token_usage": token_usage,
                 },
                 usage=cumulative_usage.as_dict(),
             )
@@ -351,10 +337,12 @@ Provide your initial answer and reasoning. Respect the following rules:
             "processing_stage": "initial_responses_collected",
         }
 
+        # Check for initial consensus - if experts agree, no need for debate
         if consensus and answer:
-            updates["final_decision"] = {"answer": answer, "reasoning": "consensus"}
+            updates["final_decision"] = {"answer": answer, "reasoning": "initial_consensus"}
             return Command(update=updates, goto="intermediate_complete")
 
+        # No consensus - proceed to structured debate rounds
         updates["round_number"] = 1
         return Command(update=updates, goto="debate_round")
 
@@ -371,10 +359,10 @@ class DebateRoundNode:
     def _get_agent(self, expert: Dict[str, Any]) -> LangGraphAgent:
         expert_id = expert.get("id")
         if expert_id not in self._agent_cache:
-            expertise = expert.get("expertise", "medical specialist")
+            role = expert.get("role") or expert.get("expertise", "medical specialist")
             self._agent_cache[expert_id] = LangGraphAgent(
                 instruction=(
-                    f"You are a {expertise} taking part in a structured debate."
+                    f"You are a {role} taking part in a structured debate."
                     " Read the other experts' arguments and, if needed, update"
                     " your answer. Always respond with JSON and limit reasoning to"
                     " 100 words."
@@ -410,7 +398,7 @@ class DebateRoundNode:
         for item in previous_responses_list:
             try:
                 eid = int(item.get("expert_id"))
-            except Exception:
+            except (ValueError, TypeError):
                 continue
             latest_by_id[eid] = item
 
@@ -461,14 +449,12 @@ Limit reasoning to 100 words.
                 latest_by_id[expert_id] = latest
 
             consensus, answer = _check_consensus_from_list(list(latest_by_id.values()))
-            token_usage = _merge_usage(state, cumulative_usage)
 
             finish_span(
                 outputs={
                     "consensus": consensus,
                     "answer": answer,
                     "round": round_number,
-                    "token_usage": token_usage,
                 },
                 usage=cumulative_usage.as_dict(),
             )
@@ -485,7 +471,6 @@ Limit reasoning to 100 words.
             return Command(update=updates, goto="intermediate_complete")
 
         if round_number >= self.MAX_ROUNDS:
-            updates["round_number"] = round_number + 1
             return Command(update=updates, goto="moderator")
 
         updates["round_number"] = round_number + 1
@@ -529,7 +514,7 @@ class ModeratorNode:
         for item in responses_list:
             try:
                 eid = int(item.get("expert_id"))
-            except Exception:
+            except (ValueError, TypeError):
                 continue
             latest_by_id[eid] = item
         consensus, answer = _check_consensus_from_list(list(latest_by_id.values()))
@@ -573,12 +558,10 @@ Limit reasoning to 200 words.
             parsed = _extract_expert_response(response)
             if not parsed.get("answer"):
                 parsed["answer"] = "A"
-            token_usage = _merge_usage(state, usage)
 
             finish_span(
                 outputs={
                     "answer": parsed.get("answer"),
-                    "token_usage": token_usage,
                 },
                 usage=usage.as_dict(),
             )
@@ -615,14 +598,10 @@ def create_intermediate_processing_subgraph(model_info: str = "gemini-2.5-flash"
     subgraph.add_node("moderator", moderator.make_final_decision)
     subgraph.add_node("intermediate_complete", finalize_intermediate_processing)
 
+    # Use only essential static edges; nodes handle routing via Command.goto
     subgraph.add_edge("__start__", "expert_recruitment")
     subgraph.add_edge("expert_recruitment", "initial_responses")
-    subgraph.add_edge("initial_responses", "debate_round")
-    subgraph.add_edge("initial_responses", "intermediate_complete")
-    subgraph.add_edge("debate_round", "debate_round")
-    subgraph.add_edge("debate_round", "moderator")
-    subgraph.add_edge("debate_round", "intermediate_complete")
-    subgraph.add_edge("moderator", "intermediate_complete")
+    # All other routing handled dynamically by Command.goto
 
     return subgraph
 
