@@ -24,6 +24,12 @@
 - Mirror module names: `test_langgraph_<topic>.py`. See `test_langsmith_integration.py` for patterns.
 - Avoid real network/LLM calls; patch `_call_llm` in unit tests to keep runs deterministic.
 - Add regression tests with bug fixes, focusing on node behavior and graph routing.
+- Always run tests from the project virtualenv (`source .venv/bin/activate`) before submitting changes.
+
+## Communication Norms
+- Keep updates short and clear. Prefer plain language explanations.
+- Keep language simple.
+- Only use English for doctrings and comments.
 
 ## Commit & Pull Request Guidelines
 - Commits: imperative mood, focused scope (e.g., "Fix token accumulation in basic flow").

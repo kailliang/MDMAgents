@@ -25,6 +25,7 @@ venv/
 ENV/
 env/
 .env
+.venv
 
 # IDE
 .idea/
@@ -52,8 +53,11 @@ output/
 *.md
 !README.md
 !AGENTS.md
-old_utils.py
-old_main.py
+.claude
+.__pycache__
+.pytest_cache/
+.tmp/
+
 
 # Large files
 *.jsonl

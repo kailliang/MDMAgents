@@ -629,14 +629,3 @@ def validate_environment():
         print(f"Warning: Missing environment variables: {missing}")
         return False
     return True
-
-
-if __name__ == "__main__":
-    # Basic smoke test
-    state = MDMState(
-        messages=[],
-        question="What is hypertension?",
-        difficulty="basic"
-    )
-    print(f"Created state: {state}")
-    print("LangGraph MDM core module loaded successfully")

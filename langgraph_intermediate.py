@@ -604,25 +604,3 @@ def create_intermediate_processing_subgraph(model_info: str = "gemini-2.5-flash"
     # All other routing handled dynamically by Command.goto
 
     return subgraph
-
-
-if __name__ == "__main__":
-    # Simple smoke test aligned with IntermediateProcessingState
-    graph = create_intermediate_processing_subgraph()
-    compiled = graph.compile()
-    demo_state: IntermediateProcessingState = {
-        "messages": [],
-        "question": "Which antibiotic is most appropriate for community acquired pneumonia in an otherwise healthy adult?",
-        "answer_options": [
-            "A) Amoxicillin",
-            "B) Azithromycin",
-            "C) Ciprofloxacin",
-            "D) Doxycycline",
-            "E) Levofloxacin",
-        ],
-        "experts": [],
-        "expert_responses": [],
-        "token_usage": {"input": 0, "output": 0},
-    }
-    result = compiled.invoke(demo_state)
-    print(json.dumps(result.get("final_decision", {}), indent=2))

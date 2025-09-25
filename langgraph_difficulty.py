@@ -326,21 +326,3 @@ def validate_difficulty_assessment(question: str, expected_difficulty: str = Non
     }
     
     return validation_result
-
-
-if __name__ == "__main__":
-    # Basic smoke test
-    test_questions = [
-        ("What is hypertension?", "basic"),
-        ("A patient needs consultation from multiple specialists for complex treatment.", "intermediate"),
-        ("Multi-organ failure requiring coordination between cardiology, nephrology, and ICU teams.", "advanced")
-    ]
-    
-    print("Difficulty Assessment Smoke Test:")
-    for question, expected in test_questions:
-        result = validate_difficulty_assessment(question, expected)
-        print(f"Question: {question[:50]}...")
-        print(f"  Assessed: {result['assessed_difficulty']} (confidence: {result['confidence']:.2f})")
-        print(f"  Expected: {expected}, Match: {result['matches_expected']}")
-        print(f"  Routes to: {result['routing_destination']}")
-        print()

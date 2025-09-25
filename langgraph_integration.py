@@ -660,26 +660,3 @@ __all__ = [
     "PerformanceMonitor",
     "IntegratedMDMSystem"
 ]
-
-
-if __name__ == "__main__":
-    # Basic smoke test
-    import asyncio
-    
-    async def test_integration():
-        system = IntegratedMDMSystem("gemini-2.5-flash")
-        
-        result = await system.process_question(
-            "What is the first-line treatment for hypertension?",
-            ["A) ACE inhibitors", "B) Beta blockers", "C) Diuretics", "D) Calcium channel blockers"]
-        )
-        
-        print("Integration test result:")
-        print(json.dumps(result, indent=2))
-        
-        status = system.get_system_status()
-        print("\nSystem status:")
-        print(json.dumps(status, indent=2, default=str))
-    
-    # Run test if this file is executed directly
-    asyncio.run(test_integration())

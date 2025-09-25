@@ -12,11 +12,11 @@ Implements Multi-Disciplinary Team (MDT) approach with complex coordination:
 """
 
 import json
-import re
 import operator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional, TypedDict, Annotated
 from langgraph.graph import StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, Send
 from langgraph_mdm import LangGraphAgent
 from langsmith_integration import span as langsmith_span, preview_text
 
@@ -79,11 +79,29 @@ def _normalize_token_usage(usage: Dict[str, int]) -> Dict[str, int]:
     return usage  # Already normalized
 
 
-def _safe_llm_call_with_truncation(agent: LangGraphAgent, prompt: str, word_limit: int) -> tuple[str, Dict[str, int]]:
+def _usage_delta(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
+    """Compute per-call token usage delta from cumulative counters"""
+    before_norm = _normalize_token_usage(before)
+    after_norm = _normalize_token_usage(after)
+
+    delta_input = max(0, after_norm.get("input", 0) - before_norm.get("input", 0))
+    delta_output = max(0, after_norm.get("output", 0) - before_norm.get("output", 0))
+
+    return {
+        "input": delta_input,
+        "output": delta_output,
+        "total_tokens": delta_input + delta_output,
+    }
+
+
+def _safe_llm_call_with_truncation(agent: LangGraphAgent, prompt: str, word_limit: int,
+                                   parent_run: Any | None = None) -> tuple[str, Dict[str, int]]:
     """Make single LLM call with smart truncation at 2x word limit if needed"""
     # Single LLM call - no retries for word limits
-    response = agent.chat(prompt)
-    usage = _normalize_token_usage(agent.get_token_usage())
+    usage_before = agent.get_token_usage()
+    response = agent.chat(prompt, parent_run=parent_run)
+    usage_after = agent.get_token_usage()
+    usage = _usage_delta(usage_before, usage_after)
     agent.clear_history()
 
     # Truncate at 2x word limit if exceeded
@@ -124,6 +142,7 @@ def _safe_llm_call_with_json_analysis_limit(call_llm_func, prompt: str, max_anal
                     continue
                 else:
                     # Last attempt failed, return fallback object
+                    total_usage["total_tokens"] = total_usage.get("input", 0) + total_usage.get("output", 0)
                     return {
                         "analysis": "JSON parsing failed after retry",
                         "final_answer": "X) Parsing error",
@@ -135,12 +154,17 @@ def _safe_llm_call_with_json_analysis_limit(call_llm_func, prompt: str, max_anal
             truncation_limit = max_analysis_words * 2
             parsed["analysis"] = _truncate_to_word_limit(analysis, truncation_limit)
 
+        total_usage["total_tokens"] = total_usage.get("input", 0) + total_usage.get("output", 0)
         return parsed, total_usage
 
     return {
         "analysis": "Unexpected error in JSON processing",
         "final_answer": "X) Processing error"
-    }, total_usage
+    }, {
+        "input": total_usage.get("input", 0),
+        "output": total_usage.get("output", 0),
+        "total_tokens": total_usage.get("input", 0) + total_usage.get("output", 0),
+    }
 
 
 class AdvancedProcessingState(TypedDict, total=False):
@@ -184,15 +208,18 @@ class MDTFormationNode:
     def _call_llm(self, prompt: str) -> tuple[str, Dict[str, int]]:
         """Make LLM call and return response with token usage"""
         agent = self._get_agent()
+        usage_before = agent.get_token_usage()
         response = agent.chat(prompt)
-        usage = agent.get_token_usage()
+        usage_after = agent.get_token_usage()
+        usage = _usage_delta(usage_before, usage_after)
 
         # Clear conversation history after each call to prevent accumulation across questions
         agent.clear_history()
 
         return response, {
-            "input": usage["input_tokens"],
-            "output": usage["output_tokens"]
+            "input": usage["input"],
+            "output": usage["output"],
+            "total_tokens": usage["total_tokens"],
         }
     
     def form_teams(self, state: AdvancedProcessingState) -> Command:
@@ -348,15 +375,18 @@ class OverallCoordinatorNode:
     def _call_llm(self, prompt: str) -> tuple[str, Dict[str, int]]:
         """Make LLM call and return response with token usage"""
         agent = self._get_agent()
+        usage_before = agent.get_token_usage()
         response = agent.chat(prompt)
-        usage = agent.get_token_usage()
+        usage_after = agent.get_token_usage()
+        usage = _usage_delta(usage_before, usage_after)
 
         # Clear conversation history after each call to prevent accumulation across questions
         agent.clear_history()
 
         return response, {
-            "input": usage["input_tokens"],
-            "output": usage["output_tokens"]
+            "input": usage["input"],
+            "output": usage["output"],
+            "total_tokens": usage["total_tokens"],
         }
     
     def coordinate_decision(self, state: AdvancedProcessingState) -> Command:
@@ -427,65 +457,6 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
                 goto="__end__"
             )
     
-    def _parse_coordinator_json(self, response: str) -> Dict[str, Any]:
-        """Parse coordinator response with robust JSON extraction"""
-        # Try direct JSON parsing first
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            pass
-
-        # Clean and try again
-        cleaned_response = _clean_json_response(response)
-        try:
-            return json.loads(cleaned_response)
-        except json.JSONDecodeError:
-            pass
-
-        # Find JSON object with proper nesting support
-        brace_count = 0
-        start_idx = -1
-
-        for i, char in enumerate(response):
-            if char == '{':
-                if start_idx == -1:
-                    start_idx = i
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0 and start_idx != -1:
-                    json_str = response[start_idx:i+1]
-                    try:
-                        parsed = json.loads(json_str)
-                        # Verify it has required keys
-                        if "analysis" in parsed or "final_answer" in parsed:
-                            return parsed
-                    except json.JSONDecodeError:
-                        continue
-
-        # Final fallback
-        return {
-            "analysis": response[:300] if response else "Unable to parse coordinator response",
-            "final_answer": self._extract_answer_from_text(response)
-        }
-
-    def _extract_answer_from_text(self, text: str) -> str:
-        """Extract answer from free text response"""
-        # Look for patterns like "A)", "(A)", "Answer: A", etc.
-        patterns = [
-            r'\b([A-D])\)\s*',
-            r'\(([A-D])\)',
-            r'Answer:\s*([A-D])',
-            r'answer\s+is\s+([A-D])',
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return f"{match.group(1)}) Coordinator decision"
-
-        return "X) Unable to extract answer"
-
     def _call_llm_with_analysis_limit(self, prompt: str, max_analysis_words: int) -> tuple[Dict[str, Any], Dict[str, int]]:
         """Make LLM call with smart JSON analysis truncation - returns parsed object"""
         return _safe_llm_call_with_json_analysis_limit(self._call_llm, prompt, max_analysis_words)
@@ -493,49 +464,97 @@ Analyze all MDT assessments and provide your final decision in exactly this JSON
 
 # Team processing functions for LangGraph native parallelization
 
-def process_single_team(team: Dict, question: str, answer_options: List[str], model_info: str) -> Dict[str, Any]:
-    """Process a single team's internal discussion with authentic 4 LLM call MDT pattern - SYNC VERSION"""
+def process_single_team(team: Dict, question: str, answer_options: List[str], model_info: str,
+                        parent_run: Any | None = None) -> Dict[str, Any]:
+    """Process a single team's internal discussion with concurrent member investigations"""
     team_name = team.get("team_name", "Medical Team")
     members = team.get("members", [])
     
     # Identify lead member and assistants
     lead_member = identify_lead_member(members)
-    assist_members = [m for m in members if m != lead_member]
-    
-    # Create lead agent
     lead_role = lead_member.get("role", "team lead")
+    
+    # Format answer options once
+    options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
+
+    def _build_prompt(role: str, is_lead: bool) -> str:
+        if is_lead:
+            return (
+                f"You are a {role} providing your medical investigation for this case:\n\n"
+                f"Question: {question}\n\n"
+                f"Answer Options:\n{options_text}\n\n"
+                "As the team lead with your medical expertise, provide your professional assessment of this case. "
+                "Focus on determining the correct answer from the options above.\n\n"
+                "**CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"
+            )
+        return (
+            f"You are a {role} working in a medical team focused on {team_name}. Provide your professional medical investigation for this case:\n\n"
+            f"Question: {question}\n\n"
+            f"Answer Options:\n{options_text}\n\n"
+            f"Based on your expertise as a {role}, provide your medical assessment of this case. Focus on determining the correct answer from the options above.\n\n"
+            "**CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"
+        )
+
+    def _member_instruction(role: str, expertise: str, is_lead: bool) -> str:
+        if is_lead:
+            return f"You are a {role} leading a medical team discussion."
+        return f"You are a {role} who {expertise.lower()}."
+
+    # Launch investigations for all members (lead + assistants) concurrently to maximize overlap
+    member_entries: List[tuple[int, Dict, bool]] = [
+        (idx, member, member == lead_member)
+        for idx, member in enumerate(members)
+    ]
+
+    member_results: List[tuple[int, bool, str, str, Dict[str, int]]] = []
+
+    with ThreadPoolExecutor(max_workers=max(1, len(member_entries))) as executor:
+        future_map = {}
+        for idx, member, is_lead in member_entries:
+            role = member.get("role", "team member")
+            expertise = member.get("expertise_description", "medical expertise")
+            instruction = _member_instruction(role, expertise, is_lead)
+            prompt = _build_prompt(role, is_lead)
+
+            agent = LangGraphAgent(
+                instruction=instruction,
+                role=role.lower(),
+                model_info=model_info,
+            )
+
+            future = executor.submit(
+                _safe_llm_call_with_truncation,
+                agent,
+                prompt,
+                100,
+                parent_run,
+            )
+            future_map[future] = (idx, is_lead, role)
+
+        for future in as_completed(future_map):
+            idx, is_lead, role = future_map[future]
+            investigation, usage = future.result()
+            member_results.append((idx, is_lead, role, investigation, usage))
+
+    member_results.sort(key=lambda item: item[0])
+
+    lead_investigation = ""
+    lead_investigation_usage = {"input": 0, "output": 0, "total_tokens": 0}
+    investigations: List[tuple] = []
+
+    for _, is_lead, role, investigation, usage in member_results:
+        if is_lead:
+            lead_investigation = investigation
+            lead_investigation_usage = usage
+        else:
+            investigations.append((role, investigation, usage))
+
+    # Create dedicated lead agent for synthesis step
     lead_agent = LangGraphAgent(
         instruction=f"You are a {lead_role} leading a medical team discussion.",
         role=lead_role.lower(),
         model_info=model_info
     )
-    
-    # STEP 1: Lead investigation call (100 words) - Lead investigates same as assistants
-    # Format answer options
-    options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
-
-    lead_investigation_prompt = f"""You are a {lead_role} providing your medical investigation for this case:
-
-Question: {question}
-
-Answer Options:
-{options_text}
-
-As the team lead with your medical expertise, provide your professional assessment of this case. Focus on determining the correct answer from the options above.
-
-**CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
-
-    # Single LLM call with smart truncation (100 words, max 200)
-    lead_investigation, lead_investigation_usage = _safe_llm_call_with_truncation(
-        lead_agent, lead_investigation_prompt, 100
-    )
-    
-    # STEP 2: Assistant investigations (100 words each) 
-    investigations = []
-    if assist_members:
-        investigations = gather_member_investigations_sync(
-            assist_members, team_name, question, answer_options, model_info
-        )
     
     # STEP 3: Compile investigations
     gathered_investigation = ""
@@ -567,7 +586,10 @@ Based on synthesizing all team member investigations above, determine which opti
     
     # Single LLM call with smart truncation (100 words, max 200)
     team_assessment, lead_synthesis_usage = _safe_llm_call_with_truncation(
-        lead_agent, synthesis_prompt, 100
+        lead_agent,
+        synthesis_prompt,
+        100,
+        parent_run,
     )
     
     # Calculate total token usage for this team (lead investigation + synthesis + assistants)
@@ -594,30 +616,25 @@ Based on synthesizing all team member investigations above, determine which opti
     }
 
 
-def gather_member_investigations_sync(members: List[Dict], team_goal: str,
-                                     question: str, answer_options: List[str], model_info: str) -> List[tuple]:
-    """Gather investigations from assistant members - sequential processing with agent pooling"""
+def gather_member_investigations_parallel(members: List[Dict], team_goal: str,
+                                          question: str, answer_options: List[str], model_info: str,
+                                          parent_run: Any | None = None) -> List[tuple]:
+    """Gather assistant investigations concurrently for faster MDT execution"""
 
-    # Pool agents by role to avoid repeated instantiation
-    agent_pool = {}
-    investigations = []
+    if not members:
+        return []
 
-    for member in members:
+    options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
+
+    def _run_investigation(index: int, member: Dict) -> tuple:
         role = member.get("role", "team member")
         expertise = member.get("expertise_description", "medical expertise")
 
-        # Reuse agent if already created for this role, otherwise create new one
-        if role not in agent_pool:
-            agent_pool[role] = LangGraphAgent(
-                instruction=f"You are a {role} who {expertise.lower()}.",
-                role=role.lower(),
-                model_info=model_info
-            )
-
-        member_agent = agent_pool[role]
-
-        # Direct investigation prompt - no lead dependency
-        options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
+        member_agent = LangGraphAgent(
+            instruction=f"You are a {role} who {expertise.lower()}.",
+            role=role.lower(),
+            model_info=model_info
+        )
 
         investigation_prompt = f"""You are a {role} working in a medical team focused on {team_goal}. Provide your professional medical investigation for this case:
 
@@ -630,12 +647,26 @@ Based on your expertise as a {role}, provide your medical assessment of this cas
 
 **CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
 
-        # Single LLM call with smart truncation (100 words, max 200)
-        investigation, usage = _safe_llm_call_with_truncation(member_agent, investigation_prompt, 100)
+        investigation, usage = _safe_llm_call_with_truncation(
+            member_agent,
+            investigation_prompt,
+            100,
+            parent_run=parent_run,
+        )
+        return index, role, investigation, usage
 
-        investigations.append((role, investigation, usage))
+    investigations: List[tuple] = []
+    with ThreadPoolExecutor(max_workers=len(members)) as executor:
+        future_map = {
+            executor.submit(_run_investigation, idx, member): idx
+            for idx, member in enumerate(members)
+        }
 
-    return investigations
+        for future in as_completed(future_map):
+            investigations.append(future.result())
+
+    investigations.sort(key=lambda item: item[0])
+    return [(role, investigation, usage) for (_, role, investigation, usage) in investigations]
 
 
 # Individual team processing nodes for LangGraph native parallelization
@@ -652,7 +683,7 @@ def process_team(state: AdvancedProcessingState, team_index: int) -> Dict[str, A
             "team_index": team_index + 1,  # Display 1-based for humans
             "team_name": team.get("team_name") if team else None,
         },
-    ) as (_, finish_span):
+    ) as (team_run, finish_span):
         if team is None:
             fallback = {
                 "team_results": [{
@@ -668,24 +699,35 @@ def process_team(state: AdvancedProcessingState, team_index: int) -> Dict[str, A
         answer_options = state.get("answer_options", [])
         model_info = state.get('_model_info', 'gemini-2.5-flash')
 
-        result = process_single_team(team, question, answer_options, model_info)
+        result = process_single_team(
+            team,
+            question,
+            answer_options,
+            model_info,
+            parent_run=team_run,
+        )
+
+        normalized_usage = {
+            "input": result["token_usage"].get("input_tokens", 0),
+            "output": result["token_usage"].get("output_tokens", 0),
+        }
+        normalized_usage["total_tokens"] = normalized_usage["input"] + normalized_usage["output"]
 
         assessment_data = {
             "team_name": result["team_name"],
-            "assessment": result["assessment"]
+            "assessment": result["assessment"],
+            "token_usage": normalized_usage,
         }
         formatted_result = {
             "team_results": [assessment_data],
-            "token_usage": {
-                "input": result["token_usage"]["input_tokens"],
-                "output": result["token_usage"]["output_tokens"]
-            }
+            "token_usage": normalized_usage,
         }
 
         finish_span(
             outputs={
                 "team_name": result["team_name"],
                 "token_usage": formatted_result["token_usage"],
+                "assistant_calls": len(result.get("investigations", [])),
             },
             usage={
                 "input_tokens": result["token_usage"].get("input_tokens", 0),
@@ -744,9 +786,11 @@ def compile_team_results(state: AdvancedProcessingState) -> Dict[str, Any]:
                 assessments["specialist"].append(assessment_data)
 
         compiled_report = compile_assessment_report(assessments)
+
+        aggregated_usage = state.get("token_usage", {"input": 0, "output": 0})
         total_usage = {
-            "input": sum(result.get("token_usage", {}).get("input", 0) for result in team_results),
-            "output": sum(result.get("token_usage", {}).get("output", 0) for result in team_results),
+            "input": aggregated_usage.get("input", 0),
+            "output": aggregated_usage.get("output", 0),
         }
         total_usage["total_tokens"] = total_usage["input"] + total_usage["output"]
 
@@ -850,8 +894,8 @@ def create_advanced_processing_subgraph(model_info: str = "gemini-2.5-flash") ->
     coordinator = OverallCoordinatorNode(model_info=model_info)
     
     # Simplified flow for initial implementation
-    def categorize_teams_node(state: AdvancedProcessingState) -> Dict[str, Any]:
-        """Categorize teams and prepare for parallel processing"""
+    def categorize_teams_node(state: AdvancedProcessingState) -> Command:
+        """Categorize teams and fan-out processing via Send commands"""
         teams = state.get("mdt_teams", [])
         with langsmith_span(
             "advanced.categorize_teams",
@@ -861,11 +905,22 @@ def create_advanced_processing_subgraph(model_info: str = "gemini-2.5-flash") ->
             },
         ) as (_, finish_span):
             categorized = categorize_teams(teams)
-            result_state = {
-                **state,
+            update = {
                 "team_assessments": categorized,
-                "processing_stage": "teams_categorized"
+                "processing_stage": "teams_categorized",
+                "team_results": [],
             }
+
+            send_targets: List[Send] = []
+            team_nodes = ["process_team_1", "process_team_2", "process_team_3"]
+
+            base_state = {**state, **update}
+
+            for idx, node_name in enumerate(team_nodes):
+                if idx < len(teams):
+                    send_state = {**base_state, "team_results": []}
+                    send_targets.append(Send(node_name, send_state))
+
             finish_span(
                 outputs={
                     "initial": len(categorized.get("initial", [])),
@@ -873,7 +928,11 @@ def create_advanced_processing_subgraph(model_info: str = "gemini-2.5-flash") ->
                     "final_review": len(categorized.get("final_review", [])),
                 }
             )
-            return result_state
+
+            if not send_targets:
+                return Command(update=update, goto="compile_results")
+
+            return Command(update=update, goto=send_targets)
     
     def process_team_1_with_model(state: AdvancedProcessingState) -> Dict[str, Any]:
         """Process team 1 with model info"""
@@ -906,11 +965,6 @@ def create_advanced_processing_subgraph(model_info: str = "gemini-2.5-flash") ->
     # Define edges for fan-out/fan-in pattern
     subgraph.add_edge("form_teams", "categorize_teams")
     
-    # Fan-out: All teams execute in parallel from categorize_teams
-    subgraph.add_edge("categorize_teams", "process_team_1")
-    subgraph.add_edge("categorize_teams", "process_team_2")
-    subgraph.add_edge("categorize_teams", "process_team_3")
-    
     # Fan-in: All teams must complete before compile_results
     subgraph.add_edge("process_team_1", "compile_results")
     subgraph.add_edge("process_team_2", "compile_results")
@@ -923,53 +977,3 @@ def create_advanced_processing_subgraph(model_info: str = "gemini-2.5-flash") ->
     subgraph.add_edge("__start__", "form_teams")
     
     return subgraph
-
-
-if __name__ == "__main__":
-    # Safe test of advanced processing subgraph structure (no live LLM calls)
-    print("Testing advanced processing subgraph structure...")
-
-    try:
-        subgraph = create_advanced_processing_subgraph()
-        compiled_subgraph = subgraph.compile()
-        print("✓ Subgraph creation and compilation successful")
-
-        # Test state validation (no LLM calls)
-        test_state = {
-            "messages": [],
-            "question": "Test question for structure validation",
-            "answer_options": ["A) Option 1", "B) Option 2", "C) Option 3"],
-            "token_usage": {"input": 0, "output": 0}
-        }
-
-        print("✓ Test state structure is valid")
-
-        # Validate team formation structure
-        formation_node = MDTFormationNode()
-        default_teams = formation_node._create_default_teams()
-        print(f"✓ Default teams structure: {len(default_teams)} teams")
-
-        for i, team in enumerate(default_teams):
-            members = team.get("members", [])
-            print(f"  Team {i+1}: {team.get('team_name')} ({len(members)} members)")
-
-        # Validate utility functions
-        test_teams = default_teams
-        categorized = categorize_teams(test_teams)
-        print(f"✓ Team categorization: {len(categorized['initial'])} initial, {len(categorized['specialist'])} specialist, {len(categorized['final_review'])} final")
-
-        # Test word count validation
-        test_text = "This is a test sentence with multiple words for validation."
-        is_valid_50 = _validate_word_count(test_text, 50)
-        is_valid_5 = _validate_word_count(test_text, 5)
-        print(f"✓ Word count validation: {len(test_text.split())} words - valid for 50: {is_valid_50}, valid for 5: {is_valid_5}")
-
-        truncated = _truncate_to_word_limit(test_text, 5)
-        print(f"✓ Word truncation: '{truncated}'")
-
-        print("\n🎉 All structural tests passed - no LLM calls made")
-
-    except Exception as e:
-        print(f"❌ Test failed: {e}")
-        import traceback
-        traceback.print_exc()
