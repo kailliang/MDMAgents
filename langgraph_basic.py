@@ -11,21 +11,30 @@ Implements the high-performance 3-expert + arbitrator system:
 
 import json
 import re
-import os
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Tuple, Optional
 from langgraph.graph import StateGraph
 from langgraph.types import Command, Send
-from langgraph_mdm import LangGraphAgent, MDMStateDict
+from langgraph_mdm import LangGraphAgent, MDMStateDict, LLMNodeMixin, extract_answer_from_text
 from langsmith_integration import span as langsmith_span, preview_text
 
+# Import consensus checking function from intermediate pipeline
+def _check_consensus_from_list(responses: List[Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
+    """Determine whether all experts currently agree on the same answer."""
+    if not responses or len(responses) < 3:
+        return False, None
+    answers = {str(item.get("answer", "")).strip().upper() for item in responses if item.get("answer")}
+    answers = {ans for ans in answers if ans}
+    if len(answers) == 1:
+        return True, next(iter(answers))
+    return False, None
 
-class ExpertRecruitmentNode:
+
+class ExpertRecruitmentNode(LLMNodeMixin):
     """Node for recruiting 3 independent medical experts with different specialties"""
-    
+
     def __init__(self, model_info: str = "gemini-2.5-flash"):
-        self.model_info = model_info
-        self._agent = None
-    
+        super().__init__(model_info)
+
     def _get_agent(self) -> LangGraphAgent:
         """Get or create the recruitment agent"""
         if self._agent is None:
@@ -35,75 +44,6 @@ class ExpertRecruitmentNode:
                 model_info=self.model_info
             )
         return self._agent
-    
-    def _call_llm(self, prompt: str, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
-        """Make LLM call and return response with token usage"""
-        agent = self._get_agent()
-        response = agent.chat(prompt, parent_run=parent_run)
-        usage = agent.get_token_usage()
-        
-        # Clear conversation history after each call to prevent accumulation across questions
-        agent.clear_history()
-        
-        return response, {
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"]
-        }
-    
-    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3, 
-                            required_fields: List[str] = None, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
-        """Call LLM with retry on parse failures"""
-        total_usage = {"input_tokens": 0, "output_tokens": 0}
-        
-        for attempt in range(max_attempts):
-            # Add emphasis on JSON format for retries
-            if attempt > 0:
-                prompt = prompt.replace(
-                    "JSON format:", 
-                    "STRICT JSON format (return ONLY valid JSON, no other text):"
-                )
-                prompt = prompt.replace(
-                    "Return ONLY the JSON",
-                    "Return ONLY the JSON object. Do not include any text before or after the JSON."
-                )
-            
-            response, usage = self._call_llm(prompt, parent_run=parent_run)
-            total_usage["input_tokens"] += usage["input_tokens"]
-            total_usage["output_tokens"] += usage["output_tokens"]
-            
-            # Validate JSON response if we have required fields
-            if required_fields:
-                if self._validate_json_response(response, required_fields):
-                    return response, total_usage
-            else:
-                # Just check if it's valid JSON
-                try:
-                    cleaned = self._clean_json_response(response)
-                    json.loads(cleaned)
-                    return response, total_usage
-                except:
-                    pass
-        
-        # Return last attempt
-        return response, total_usage
-    
-    def _validate_json_response(self, response: str, required_fields: List[str]) -> bool:
-        """Validate if response contains valid JSON with required fields"""
-        try:
-            cleaned = self._clean_json_response(response)
-            parsed = json.loads(cleaned)
-            return all(field in parsed for field in required_fields)
-        except:
-            return False
-    
-    def _clean_json_response(self, response: str) -> str:
-        """Clean response to extract JSON"""
-        # Remove markdown code blocks
-        if '```json' in response:
-            response = response.split('```json')[1].split('```')[0]
-        elif '```' in response:
-            response = response.split('```')[1].split('```')[0]
-        return response.strip()
     
     def recruit_experts(self, state: MDMStateDict) -> Command:
         """Recruit 3 independent medical experts for the question"""
@@ -217,14 +157,13 @@ All experts should be marked as "Independent" with equal authority. Return ONLY 
             )
 
 
-class ExpertAnalysisNode:
+class ExpertAnalysisNode(LLMNodeMixin):
     """Node for individual expert analysis with JSON response parsing"""
-    
+
     def __init__(self, expert_data: Dict[str, Any], model_info: str = "gemini-2.5-flash"):
+        super().__init__(model_info)
         self.expert_data = expert_data
-        self.model_info = model_info
-        self._agent = None
-    
+
     def _get_agent(self) -> LangGraphAgent:
         """Get or create the expert agent"""
         if self._agent is None:
@@ -234,75 +173,6 @@ class ExpertAnalysisNode:
                 model_info=self.model_info
             )
         return self._agent
-    
-    def _call_llm(self, prompt: str, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
-        """Make LLM call and return response with token usage"""
-        agent = self._get_agent()
-        response = agent.chat(prompt, parent_run=parent_run)
-        usage = agent.get_token_usage()
-        
-        # Clear conversation history after each call to prevent accumulation across questions
-        agent.clear_history()
-        
-        return response, {
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"]
-        }
-    
-    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3, 
-                            required_fields: List[str] = None, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
-        """Call LLM with retry on parse failures"""
-        total_usage = {"input_tokens": 0, "output_tokens": 0}
-        
-        for attempt in range(max_attempts):
-            # Add emphasis on JSON format for retries
-            if attempt > 0:
-                prompt = prompt.replace(
-                    "JSON format:", 
-                    "STRICT JSON format (return ONLY valid JSON, no other text):"
-                )
-                prompt = prompt.replace(
-                    "Return ONLY the JSON",
-                    "Return ONLY the JSON object. Do not include any text before or after the JSON."
-                )
-            
-            response, usage = self._call_llm(prompt, parent_run=parent_run)
-            total_usage["input_tokens"] += usage["input_tokens"]
-            total_usage["output_tokens"] += usage["output_tokens"]
-            
-            # Validate JSON response if we have required fields
-            if required_fields:
-                if self._validate_json_response(response, required_fields):
-                    return response, total_usage
-            else:
-                # Just check if it's valid JSON
-                try:
-                    cleaned = self._clean_json_response(response)
-                    json.loads(cleaned)
-                    return response, total_usage
-                except:
-                    pass
-        
-        # Return last attempt
-        return response, total_usage
-    
-    def _validate_json_response(self, response: str, required_fields: List[str]) -> bool:
-        """Validate if response contains valid JSON with required fields"""
-        try:
-            cleaned = self._clean_json_response(response)
-            parsed = json.loads(cleaned)
-            return all(field in parsed for field in required_fields)
-        except:
-            return False
-    
-    def _clean_json_response(self, response: str) -> str:
-        """Clean response to extract JSON"""
-        # Remove markdown code blocks
-        if '```json' in response:
-            response = response.split('```json')[1].split('```')[0]
-        elif '```' in response:
-            response = response.split('```')[1].split('```')[0]
-        return response.strip()
     
     def analyze_question(self, state: MDMStateDict, parent_run: Any = None) -> Command:
         """Analyze the medical question and provide structured JSON response"""
@@ -389,7 +259,7 @@ class ExpertAnalysisNode:
                     "expert_id": expert['id'],
                     "role": expert['role'],
                     "reasoning": response[:300] if len(response) > 0 else "Unable to parse expert response",
-                    "answer": self._extract_answer_from_text(response)
+                    "answer": extract_answer_from_text(response, "Extracted answer")
                 }
             
             # Prepare token delta so the caller can aggregate across experts safely
@@ -419,23 +289,6 @@ class ExpertAnalysisNode:
                 },
                 goto="collect_responses"
             )
-    
-    def _extract_answer_from_text(self, text: str) -> str:
-        """Extract answer from free text response"""
-        # Look for patterns like "A)", "(A)", "Answer: A", etc.
-        patterns = [
-            r'\b([A-D])\)\s*',
-            r'\(([A-D])\)',
-            r'Answer:\s*([A-D])',
-            r'answer\s+is\s+([A-D])',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return f"{match.group(1)}) Extracted answer"
-        
-        return "X) Parse error"
 
 
 def parallel_expert_analysis(state: MDMStateDict) -> List[Send]:
@@ -471,13 +324,12 @@ def expert_analysis_router(state: MDMStateDict) -> str:
         return "collect_responses"
 
 
-class ArbitratorNode:
+class ArbitratorNode(LLMNodeMixin):
     """Node for arbitrator synthesis of expert opinions into final decision"""
-    
+
     def __init__(self, model_info: str = "gemini-2.5-flash"):
-        self.model_info = model_info
-        self._agent = None
-    
+        super().__init__(model_info)
+
     def _get_agent(self) -> LangGraphAgent:
         """Get or create the arbitrator agent"""
         if self._agent is None:
@@ -487,75 +339,6 @@ class ArbitratorNode:
                 model_info=self.model_info
             )
         return self._agent
-    
-    def _call_llm(self, prompt: str, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
-        """Make LLM call and return response with token usage"""
-        agent = self._get_agent()
-        response = agent.chat(prompt, parent_run=parent_run)
-        usage = agent.get_token_usage()
-        
-        # Clear conversation history after each call to prevent accumulation across questions
-        agent.clear_history()
-        
-        return response, {
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"]
-        }
-    
-    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3,
-                            required_fields: List[str] = None, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
-        """Call LLM with retry on parse failures"""
-        total_usage = {"input_tokens": 0, "output_tokens": 0}
-        
-        for attempt in range(max_attempts):
-            # Add emphasis on JSON format for retries
-            if attempt > 0:
-                prompt = prompt.replace(
-                    "JSON format:", 
-                    "STRICT JSON format (return ONLY valid JSON, no other text):"
-                )
-                prompt = prompt.replace(
-                    "Return ONLY the JSON",
-                    "Return ONLY the JSON object. Do not include any text before or after the JSON."
-                )
-            
-            response, usage = self._call_llm(prompt, parent_run=parent_run)
-            total_usage["input_tokens"] += usage["input_tokens"]
-            total_usage["output_tokens"] += usage["output_tokens"]
-            
-            # Validate JSON response if we have required fields
-            if required_fields:
-                if self._validate_json_response(response, required_fields):
-                    return response, total_usage
-            else:
-                # Just check if it's valid JSON
-                try:
-                    cleaned = self._clean_json_response(response)
-                    json.loads(cleaned)
-                    return response, total_usage
-                except:
-                    pass
-        
-        # Return last attempt
-        return response, total_usage
-    
-    def _validate_json_response(self, response: str, required_fields: List[str]) -> bool:
-        """Validate if response contains valid JSON with required fields"""
-        try:
-            cleaned = self._clean_json_response(response)
-            parsed = json.loads(cleaned)
-            return all(field in parsed for field in required_fields)
-        except:
-            return False
-    
-    def _clean_json_response(self, response: str) -> str:
-        """Clean response to extract JSON"""
-        # Remove markdown code blocks
-        if '```json' in response:
-            response = response.split('```json')[1].split('```')[0]
-        elif '```' in response:
-            response = response.split('```')[1].split('```')[0]
-        return response.strip()
     
     def make_final_decision(self, state: MDMStateDict) -> Command:
         """Synthesize expert opinions and make final decision"""
@@ -657,7 +440,7 @@ Analyze all expert opinions and provide your final decision in exactly this JSON
             if not final_decision_dict:
                 final_decision_dict = {
                     "analysis": response[:300] if len(response) > 0 else "Unable to parse arbitrator response",
-                    "final_answer": self._extract_answer_from_text(response)
+                    "final_answer": extract_answer_from_text(response, "Final arbitrator decision")
                 }
 
             # Update token usage
@@ -683,23 +466,71 @@ Analyze all expert opinions and provide your final decision in exactly this JSON
                 },
                 goto="basic_complete"
             )
-    
-    def _extract_answer_from_text(self, text: str) -> str:
-        """Extract answer from free text response"""
-        # Look for patterns like "A)", "(A)", "Answer: A", etc.
-        patterns = [
-            r'\b([A-D])\)\s*',
-            r'\(([A-D])\)',
-            r'Answer:\s*([A-D])',
-            r'answer\s+is\s+([A-D])',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return f"{match.group(1)}) Final arbitrator decision"
-        
-        return "X) Parse error"
+
+
+class ConsensusCheckNode:
+    """Node to check if experts have reached consensus, bypassing arbitrator if they agree"""
+
+    def check_consensus(self, state: MDMStateDict) -> Command:
+        """Check if all experts agree, skip arbitrator if consensus exists"""
+        expert_responses = state.get("expert_responses", [])
+        question_preview = preview_text(state.get("question", ""))
+
+        span_parent = state.get("langsmith_parent_run")
+        with langsmith_span(
+            "basic.consensus_check",
+            run_type="chain",
+            inputs={
+                "question_preview": question_preview,
+                "expert_count": len(expert_responses),
+            },
+            parent=span_parent,
+            require_parent=span_parent is not None,
+        ) as (consensus_run, finish_span):
+
+            # Check for consensus among expert responses
+            consensus, agreed_answer = _check_consensus_from_list(expert_responses)
+
+            current_usage = state.get("token_usage", {"input": 0, "output": 0})
+
+            if consensus and agreed_answer:
+                # All experts agree - create final decision directly
+                final_decision_dict = {
+                    "analysis": f"All experts unanimously agreed on answer {agreed_answer}",
+                    "final_answer": agreed_answer
+                }
+
+                finish_span(
+                    outputs={
+                        "consensus_found": True,
+                        "agreed_answer": agreed_answer,
+                        "token_usage": current_usage,
+                    }
+                )
+
+                return Command(
+                    update={
+                        "final_decision": final_decision_dict,
+                        "processing_stage": "consensus_complete",
+                        "token_usage": current_usage
+                    },
+                    goto="basic_complete"
+                )
+            else:
+                # No consensus - proceed to arbitrator
+                finish_span(
+                    outputs={
+                        "consensus_found": False,
+                        "token_usage": current_usage,
+                    }
+                )
+
+                return Command(
+                    update={
+                        "processing_stage": "consensus_failed_proceeding_to_arbitrator"
+                    },
+                    goto="arbitrator"
+                )
 
 
 def basic_processing_placeholder(state: MDMStateDict) -> Dict[str, Any]:
@@ -721,6 +552,7 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
     # Create node instances
     recruiter = ExpertRecruitmentNode(model_info=model_info)
     arbitrator = ArbitratorNode(model_info=model_info)
+    consensus_checker = ConsensusCheckNode()
     
     def process_all_experts(state: MDMStateDict) -> Dict[str, Any]:
         """Process all experts sequentially and collect responses"""
@@ -868,15 +700,16 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
                 "expert_token_delta": None,
                 "processing_stage": "expert_analysis_complete",
             }
-            goto = "arbitrator"
+            goto = "consensus_check"
 
         return Command(update=updates, goto=goto)
     
-    # Add nodes to subgraph  
+    # Add nodes to subgraph
     subgraph.add_node("expert_recruitment", recruiter.recruit_experts)
     subgraph.add_node("expert_analysis", parallel_expert_processing)
     subgraph.add_node("expert_analysis_node", expert_analysis_node)
     subgraph.add_node("collect_responses", collect_expert_responses)
+    subgraph.add_node("consensus_check", consensus_checker.check_consensus)
     subgraph.add_node("arbitrator", arbitrator.make_final_decision)
     subgraph.add_node("basic_complete", basic_processing_placeholder)
 
@@ -890,20 +723,3 @@ def create_basic_processing_subgraph(model_info: str = "gemini-2.5-flash") -> St
     return subgraph
 
 
-if __name__ == "__main__":
-    # Test basic processing subgraph
-    subgraph = create_basic_processing_subgraph()
-    compiled_subgraph = subgraph.compile()
-    
-    test_state = {
-        "messages": [],
-        "question": "What is the primary treatment for acute myocardial infarction?",
-        "token_usage": {"input": 0, "output": 0},
-        "agents": [],
-        "expert_responses": []
-    }
-    
-    print("Testing basic processing subgraph...")
-    result = compiled_subgraph.invoke(test_state)
-    print(f"Final decision: {result.get('final_decision', {})}")
-    print(f"Token usage: {result.get('token_usage', {})}")

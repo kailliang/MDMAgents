@@ -11,6 +11,7 @@ import sys
 import traceback
 import logging
 import warnings
+import re
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
@@ -224,6 +225,117 @@ class LangGraphAgent:
 
 # Use LangGraphAgent as Agent for this implementation
 Agent = LangGraphAgent
+
+
+class LLMNodeMixin:
+    """
+    Shared mixin for LangGraph nodes that need common LLM helper methods.
+    Provides consistent retry logic, JSON parsing, and response handling.
+    """
+
+    def __init__(self, model_info: str):
+        self.model_info = model_info
+        self._agent = None
+
+    def _get_agent(self) -> LangGraphAgent:
+        """Get or create the agent - must be implemented by subclasses"""
+        raise NotImplementedError("Subclasses must implement _get_agent method")
+
+    def _call_llm(self, prompt: str, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
+        """Make LLM call and return response with token usage"""
+        agent = self._get_agent()
+        response = agent.chat(prompt, parent_run=parent_run)
+        usage = agent.get_token_usage()
+
+        # Clear conversation history after each call to prevent accumulation across questions
+        agent.clear_history()
+
+        return response, {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"]
+        }
+
+    def _call_llm_with_retry(self, prompt: str, max_attempts: int = 3,
+                            required_fields: List[str] = None, parent_run: Any = None) -> tuple[str, Dict[str, int]]:
+        """Call LLM with retry on parse failures"""
+        total_usage = {"input_tokens": 0, "output_tokens": 0}
+
+        for attempt in range(max_attempts):
+            # Add emphasis on JSON format for retries
+            if attempt > 0:
+                prompt = prompt.replace(
+                    "JSON format:",
+                    "STRICT JSON format (return ONLY valid JSON, no other text):"
+                )
+                prompt = prompt.replace(
+                    "Return ONLY the JSON",
+                    "Return ONLY the JSON object. Do not include any text before or after the JSON."
+                )
+
+            response, usage = self._call_llm(prompt, parent_run=parent_run)
+            total_usage["input_tokens"] += usage["input_tokens"]
+            total_usage["output_tokens"] += usage["output_tokens"]
+
+            # Validate JSON response if we have required fields
+            if required_fields:
+                if self._validate_json_response(response, required_fields):
+                    return response, total_usage
+            else:
+                # Just check if it's valid JSON
+                try:
+                    cleaned = self._clean_json_response(response)
+                    json.loads(cleaned)
+                    return response, total_usage
+                except:
+                    pass
+
+        # Return last attempt
+        return response, total_usage
+
+    def _validate_json_response(self, response: str, required_fields: List[str]) -> bool:
+        """Validate if response contains valid JSON with required fields"""
+        try:
+            cleaned = self._clean_json_response(response)
+            parsed = json.loads(cleaned)
+            return all(field in parsed for field in required_fields)
+        except:
+            return False
+
+    def _clean_json_response(self, response: str) -> str:
+        """Clean response to extract JSON"""
+        # Remove markdown code blocks
+        if '```json' in response:
+            response = response.split('```json')[1].split('```')[0]
+        elif '```' in response:
+            response = response.split('```')[1].split('```')[0]
+        return response.strip()
+
+
+def extract_answer_from_text(text: str, role_suffix: str = "Extracted answer") -> str:
+    """
+    Shared utility to extract answer from free text response.
+
+    Args:
+        text: The text to extract answer from
+        role_suffix: Suffix to append to extracted answer for identification
+
+    Returns:
+        Formatted answer string
+    """
+    # Look for patterns like "A)", "(A)", "Answer: A", etc.
+    patterns = [
+        r'\b([A-D])\)\s*',
+        r'\(([A-D])\)',
+        r'Answer:\s*([A-D])',
+        r'answer\s+is\s+([A-D])',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return f"{match.group(1)}) {role_suffix}"
+
+    return "X) Parse error"
 
 
 def _merge_expert_responses(
