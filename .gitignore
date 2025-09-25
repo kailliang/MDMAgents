@@ -51,6 +51,7 @@ evaluation/
 output/
 *.md
 !README.md
+!AGENTS.md
 old_utils.py
 old_main.py
 
