@@ -484,62 +484,60 @@ def process_single_team(team: Dict, question: str, answer_options: List[str], mo
         model_info=model_info
     )
     
-    # STEP 1: Lead coordination call (50 words) - Following old_utils.py:294-301
-    delivery_prompt = f"""You are the lead of the medical group which aims to {team_name}. You have the following assistant clinicians who work for you:"""
-    if assist_members:
-        for a_mem in assist_members:
-            delivery_prompt += f"\n{a_mem.get('role', 'Assistant')}"
-    else:
-        delivery_prompt += "\nYou are working independently or with a predefined protocol to address the goal."
-    
+    # STEP 1: Lead investigation call (100 words) - Lead investigates same as assistants
     # Format answer options
     options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
-    
-    delivery_prompt += f"""
+
+    lead_investigation_prompt = f"""You are a {lead_role} providing your medical investigation for this case:
+
+Question: {question}
 
 Answer Options:
 {options_text}
 
-Now, given the medical query and answer options above, provide a short answer to what kind investigations are needed from each assistant clinicians (if any), or outline your approach. Focus on determining the correct answer from the options. 
+As the team lead with your medical expertise, provide your professional assessment of this case. Focus on determining the correct answer from the options above.
 
-**CRITICAL: Your response MUST be 50 words or less. Responses over 50 words will be rejected.**
+**CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
 
-Question: {question}"""
-    
-    # Call with word limit validation (50 words)
+    # Call with word limit validation (100 words)
     for attempt in range(3):  # Allow 2 retries
-        lead_delivery = lead_agent.chat(delivery_prompt)
-        lead_delivery_usage = lead_agent.get_token_usage()
+        lead_investigation = lead_agent.chat(lead_investigation_prompt)
+        lead_investigation_usage = lead_agent.get_token_usage()
         lead_agent.clear_history()
 
-        if _validate_word_count(lead_delivery, 50):
+        if _validate_word_count(lead_investigation, 100):
             break
 
         if attempt < 2:
-            delivery_prompt += f"\n\nIMPORTANT: Previous response exceeded 50 words ({len(lead_delivery.split())} words). Please provide a shorter response within the 50-word limit."
+            lead_investigation_prompt += f"\n\nIMPORTANT: Previous response exceeded 100 words ({len(lead_investigation.split())} words). Please provide a shorter response within the 100-word limit."
         else:
             # Final fallback: truncate
-            lead_delivery = _truncate_to_word_limit(lead_delivery, 50)
+            lead_investigation = _truncate_to_word_limit(lead_investigation, 100)
     
-    # STEP 2: Assistant investigations (100 words each) - Following old_utils.py:318-320
+    # STEP 2: Assistant investigations (100 words each) 
     investigations = []
     if assist_members:
         investigations = gather_member_investigations_sync(
-            assist_members, lead_delivery, team_name, question, answer_options, model_info
+            assist_members, team_name, question, answer_options, model_info
         )
     
-    # STEP 3: Compile investigations - Following old_utils.py:322-327
+    # STEP 3: Compile investigations
     gathered_investigation = ""
+
+    # Include lead's investigation first (same as other investigators)
+    lead_role = lead_member.get("role", "Team Lead")
+    gathered_investigation += f"[{lead_role}]\n{lead_investigation}\n\n"
+
+    # Then add assistant investigations if any
     if investigations:
         for investigation_item in investigations:
             if len(investigation_item) >= 2:
                 role, investigation = investigation_item[0], investigation_item[1]
-                gathered_investigation += f"[{role}]\n{investigation}\n"
-    else:
-        gathered_investigation = lead_delivery
+                gathered_investigation += f"[{role}]\n{investigation}\n\n"
     
-    # STEP 4: Lead final synthesis (100 words) - Following old_utils.py:330-332
-    investigation_prompt = f"""The gathered investigation from your assistant clinicians (or your own initial assessment if working alone) is as follows:
+    # STEP 3: Lead final synthesis (100 words) - Synthesize all team investigations
+    synthesis_prompt = f"""As team lead, review all team member investigations (including your own) and provide your final team decision:
+
 {gathered_investigation}
 
 Question: {question}
@@ -547,13 +545,13 @@ Question: {question}
 Answer Options:
 {options_text}
 
-Based on the team investigations above, determine which option is most appropriate and provide your reasoning. Focus on selecting the correct answer from the options. 
+Based on synthesizing all team member investigations above, determine which option is most appropriate and provide your final team reasoning. Focus on selecting the correct answer from the options.
 
 **CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
     
     # Call with word limit validation (100 words)
     for attempt in range(3):  # Allow 2 retries
-        team_assessment = lead_agent.chat(investigation_prompt)
+        team_assessment = lead_agent.chat(synthesis_prompt)
         lead_synthesis_usage = lead_agent.get_token_usage()
         lead_agent.clear_history()
 
@@ -561,15 +559,15 @@ Based on the team investigations above, determine which option is most appropria
             break
 
         if attempt < 2:
-            investigation_prompt += f"\n\nIMPORTANT: Previous response exceeded 100 words ({len(team_assessment.split())} words). Please provide a shorter response within the 100-word limit."
+            synthesis_prompt += f"\n\nIMPORTANT: Previous response exceeded 100 words ({len(team_assessment.split())} words). Please provide a shorter response within the 100-word limit."
         else:
             # Final fallback: truncate
             team_assessment = _truncate_to_word_limit(team_assessment, 100)
     
-    # Calculate total token usage for this team (lead + assistants)
+    # Calculate total token usage for this team (lead investigation + synthesis + assistants)
     total_tokens = {
-        "input_tokens": lead_delivery_usage["input_tokens"] + lead_synthesis_usage["input_tokens"],
-        "output_tokens": lead_delivery_usage["output_tokens"] + lead_synthesis_usage["output_tokens"]
+        "input_tokens": lead_investigation_usage["input_tokens"] + lead_synthesis_usage["input_tokens"],
+        "output_tokens": lead_investigation_usage["output_tokens"] + lead_synthesis_usage["output_tokens"]
     }
     
     # Add assistant token usage
@@ -583,15 +581,15 @@ Based on the team investigations above, determine which option is most appropria
         "team_name": team_name,
         "assessment": team_assessment,
         "token_usage": total_tokens,
-        "lead_delivery": lead_delivery,
+        "lead_investigation": lead_investigation,
         "investigations": investigations,
         "gathered_investigation": gathered_investigation
     }
 
 
-def gather_member_investigations_sync(members: List[Dict], lead_delivery: str, 
-                                     team_goal: str, question: str, answer_options: List[str], model_info: str) -> List[tuple]:
-    """Gather investigations from assistant members - Following old_utils.py:318-320"""
+def gather_member_investigations_sync(members: List[Dict], team_goal: str,
+                                     question: str, answer_options: List[str], model_info: str) -> List[tuple]:
+    """Gather investigations from assistant members - parallel investigation"""
     
     investigations = []
     for member in members:
@@ -605,18 +603,17 @@ def gather_member_investigations_sync(members: List[Dict], lead_delivery: str,
             model_info=model_info
         )
         
-        # Enhanced prompt with answer options - based on old_utils.py:319
+        # Direct investigation prompt - no lead dependency
         options_text = "\n".join(answer_options) if answer_options else "Multiple choice options not provided"
-        
-        investigation_prompt = f"""You are in a medical group where the goal is to {team_goal}. Your group lead is asking for the following investigations:
-{lead_delivery}
+
+        investigation_prompt = f"""You are a {role} working in a medical team focused on {team_goal}. Provide your professional medical investigation for this case:
 
 Question: {question}
 
 Answer Options:
 {options_text}
 
-Please remind your expertise and return your investigation summary that contains the core information. Focus on helping determine the correct answer from the options above. 
+Based on your expertise as a {role}, provide your medical assessment of this case. Focus on determining the correct answer from the options above.
 
 **CRITICAL: Your response MUST be 100 words or less. Responses over 100 words will be rejected.**"""
         
@@ -912,29 +909,47 @@ def identify_lead_member(members: List[Dict]) -> Dict:
 def compile_assessment_report(assessments: Dict[str, List[Dict]]) -> str:
     """Compile assessment report from categorized teams"""
     report = ""
-    
+
     # Initial assessments
     report += "[Initial Assessments]\n"
-    for idx, assessment in enumerate(assessments.get("initial", [])):
-        team_name = assessment.get("team_name", f"Team {idx+1}")
+    for assessment in assessments.get("initial", []):
+        team_name = assessment.get("team_name", "Unknown Team")
         content = assessment.get("assessment", "No assessment available")
-        report += f"Team {idx+1} - {team_name}:\n{content}\n\n"
-    
+        # Extract team number from team_name or use fallback
+        team_number = _extract_team_number(team_name)
+        report += f"Team {team_number} - {team_name}:\n{content}\n\n"
+
     # Specialist assessments
     report += "[Specialist Team Assessments]\n"
-    for idx, assessment in enumerate(assessments.get("specialist", [])):
-        team_name = assessment.get("team_name", f"Team {idx+1}")
+    for assessment in assessments.get("specialist", []):
+        team_name = assessment.get("team_name", "Unknown Team")
         content = assessment.get("assessment", "No assessment available")
-        report += f"Team {idx+1} - {team_name}:\n{content}\n\n"
-    
+        team_number = _extract_team_number(team_name)
+        report += f"Team {team_number} - {team_name}:\n{content}\n\n"
+
     # Final review assessments
     report += "[Final Review Team Decisions]\n"
-    for idx, assessment in enumerate(assessments.get("final_review", [])):
-        team_name = assessment.get("team_name", f"Team {idx+1}")
+    for assessment in assessments.get("final_review", []):
+        team_name = assessment.get("team_name", "Unknown Team")
         content = assessment.get("assessment", "No assessment available")
-        report += f"Team {idx+1} - {team_name}:\n{content}\n\n"
-    
+        team_number = _extract_team_number(team_name)
+        report += f"Team {team_number} - {team_name}:\n{content}\n\n"
+
     return report
+
+
+def _extract_team_number(team_name: str) -> int:
+    """Extract team number from team name for consistent numbering"""
+    team_name_lower = team_name.lower()
+
+    # Map team names to their original numbers
+    if "initial" in team_name_lower or "iat" in team_name_lower:
+        return 1
+    elif "final" in team_name_lower or "review" in team_name_lower or "frdt" in team_name_lower:
+        return 3
+    else:
+        # Specialist or any other team gets number 2
+        return 2
 
 
 
