@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Annotated, TypedDict
 
 from langgraph.graph import StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, Send
 
 from langgraph_mdm import LangGraphAgent, _merge_expert_responses
 from langsmith_integration import preview_text, span as langsmith_span
@@ -242,27 +243,63 @@ Return only the JSON object.
 
 
 class ExpertResponseNode:
-    """Collect structured responses from experts for the current round."""
+    """Dispatcher for fan-out to individual expert nodes using native LangGraph parallelism."""
 
     def __init__(self, model_info: str = "gemini-2.5-flash") -> None:
         self.model_info = model_info
-        self._agent_cache: Dict[int, LangGraphAgent] = {}
+
+    def dispatch_to_experts(self, state: IntermediateProcessingState) -> Command:
+        """Fan out to individual expert nodes for parallel processing."""
+        experts = state.get("experts", [])
+
+        if len(experts) != 3:
+            # Fallback for malformed expert list
+            return Command(
+                update={"processing_stage": "expert_dispatch_failed"},
+                goto="moderator"
+            )
+
+        with langsmith_span(
+            "intermediate.dispatch_experts",
+            run_type="chain",
+            inputs={
+                "expert_count": len(experts),
+                "experts": [exp.get("role") for exp in experts],
+            },
+        ) as (_, finish_span):
+            # Use Send API for dynamic parallel execution
+            send_targets = []
+            for i, expert in enumerate(experts):
+                expert_state = {**state, "_current_expert": expert}
+                send_targets.append(Send(f"expert_{i+1}_response", expert_state))
+
+            finish_span(outputs={"dispatched_experts": len(send_targets)})
+
+            return Command(
+                update={"processing_stage": "experts_dispatched"},
+                goto=send_targets
+            )
+
+class IndividualExpertNode:
+    """Process a single expert's response - designed for native LangGraph parallel execution."""
+
+    def __init__(self, model_info: str = "gemini-2.5-flash") -> None:
+        self.model_info = model_info
+        self._agent: Optional[LangGraphAgent] = None
 
     def _get_agent(self, expert: Dict[str, Any]) -> LangGraphAgent:
-        expert_id = expert.get("id")
-        if expert_id not in self._agent_cache:
-            # Prefer role (unified shape); fallback to expertise
+        if self._agent is None:
             role = expert.get("role") or expert.get("expertise") or "medical specialist"
             description = expert.get("description", "")
-            self._agent_cache[expert_id] = LangGraphAgent(
+            self._agent = LangGraphAgent(
                 instruction=(
                     f"You are a {role} participating in a collaborative medical board. "
                     "Provide concise, structured answers in JSON and limit reasoning to 100 words."
                 ),
-                role=f"expert_{expert_id}",
+                role=f"expert_{expert.get('id', 'unknown')}",
                 model_info=self.model_info,
             )
-        return self._agent_cache[expert_id]
+        return self._agent
 
     def _call_expert(self, expert: Dict[str, Any], prompt: str) -> Tuple[str, UsageDelta]:
         agent = self._get_agent(expert)
@@ -274,26 +311,17 @@ class ExpertResponseNode:
             output_tokens=usage.get("output_tokens", 0),
         )
 
-    def provide_initial_responses(self, state: IntermediateProcessingState) -> Command:
-        experts = state.get("experts", [])
+    def process_expert_response(self, state: IntermediateProcessingState) -> Dict[str, Any]:
+        """Process a single expert's initial response - runs in parallel with other experts."""
+
+        # Extract expert info from state (set by fan-out dispatcher)
+        expert = state.get("_current_expert", {})
         question = state["question"]
         options = state.get("answer_options", [])
         options_text = "\n".join(options) if options else "No answer options provided"
 
-        responses_list: List[Dict[str, Any]] = []
-        cumulative_usage = UsageDelta()
-
-        with langsmith_span(
-            "intermediate.initial_responses",
-            run_type="chain",
-            inputs={
-                "experts": [expert.get("role") or expert.get("expertise") for expert in experts],
-                "question_preview": preview_text(question),
-            },
-        ) as (_, finish_span):
-            for expert in experts:
-                expert_id = int(expert.get("id"))
-                prompt = f"""
+        expert_id = int(expert.get("id", 0))
+        prompt = f"""
 You are the {expert.get('role') or expert.get('expertise', 'medical expert')} for a medical board.
 
 Question:
@@ -306,45 +334,93 @@ Provide your initial answer and reasoning. Respect the following rules:
 - Limit reasoning to 100 words.
 - Return JSON exactly as {{"answer": "A/B/C/D/E", "reasoning": "..."}}.
 """
-                response, usage = self._call_expert(expert, prompt)
-                cumulative_usage.input_tokens += usage.input_tokens
-                cumulative_usage.output_tokens += usage.output_tokens
-                parsed = _extract_expert_response(response)
-                responses_list.append(
-                    {
-                        "expert_id": expert_id,
-                        "role": expert.get("role") or expert.get("expertise", "expert"),
-                        "answer": parsed.get("answer", ""),
-                        "reasoning": parsed.get("reasoning", ""),
-                        "round": 1,
-                    }
-                )
 
-            consensus, answer = _check_consensus_from_list(responses_list)
+        with langsmith_span(
+            "intermediate.individual_expert_response",
+            run_type="chain",
+            inputs={
+                "expert_role": expert.get("role") or expert.get("expertise"),
+                "expert_id": expert_id,
+                "question_preview": preview_text(question),
+            },
+        ) as (_, finish_span):
+            response, usage = self._call_expert(expert, prompt)
+            parsed = _extract_expert_response(response)
+
+            expert_response = {
+                "expert_id": expert_id,
+                "role": expert.get("role") or expert.get("expertise", "expert"),
+                "answer": parsed.get("answer", ""),
+                "reasoning": parsed.get("reasoning", ""),
+                "round": 1,
+            }
+
+            finish_span(
+                outputs={
+                    "answer": parsed.get("answer"),
+                    "role": expert.get("role"),
+                },
+                usage=usage.as_dict(),
+            )
+
+        # Return state update that will be merged by LangGraph's native parallel processing
+        return {
+            "expert_responses": [expert_response],  # Will be merged by Annotated reducer
+            "token_usage": usage.as_dict(),  # Will be accumulated by Annotated reducer
+            # Remove processing_stage update to avoid concurrent update conflicts
+        }
+
+class ConsensusCheckerNode:
+    """Check for consensus after parallel expert responses and route accordingly."""
+
+    def __init__(self, model_info: str = "gemini-2.5-flash") -> None:
+        self.model_info = model_info
+
+    def check_consensus(self, state: IntermediateProcessingState) -> Command:
+        """Check if experts reached consensus and route to appropriate next step."""
+        responses = state.get("expert_responses", [])
+
+        with langsmith_span(
+            "intermediate.consensus_check",
+            run_type="chain",
+            inputs={
+                "response_count": len(responses),
+                "processing_stage": state.get("processing_stage"),
+            },
+        ) as (_, finish_span):
+            # Filter to only the most recent responses from each expert (round 1)
+            latest_by_id = {}
+            for response in responses:
+                expert_id = response.get("expert_id")
+                round_num = response.get("round", 0)
+                if expert_id is not None and round_num == 1:  # Only initial responses
+                    latest_by_id[expert_id] = response
+
+            consensus, answer = _check_consensus_from_list(list(latest_by_id.values()))
 
             finish_span(
                 outputs={
                     "consensus": consensus,
                     "answer": answer,
-                },
-                usage=cumulative_usage.as_dict(),
+                    "experts_responded": len(latest_by_id),
+                }
             )
 
-        updates: Dict[str, Any] = {
-            # Use list-based aggregator to avoid concurrent update issues
-            "expert_responses": responses_list,
-            "token_usage": cumulative_usage.as_dict(),
-            "processing_stage": "initial_responses_collected",
-        }
+            updates = {
+                "processing_stage": "consensus_checked",
+                "round_number": 1,
+            }
 
-        # Check for initial consensus - if experts agree, no need for debate
-        if consensus and answer:
-            updates["final_decision"] = {"answer": answer, "reasoning": "initial_consensus"}
-            return Command(update=updates, goto="intermediate_complete")
+            if consensus and answer:
+                # Initial consensus reached - skip debate rounds
+                updates["final_decision"] = {"answer": answer, "reasoning": "initial_consensus"}
+                updates["processing_stage"] = "consensus_reached"
+                return Command(update=updates, goto="intermediate_complete")
+            else:
+                # No consensus - proceed to debate rounds
+                updates["processing_stage"] = "debate_required"
+                return Command(update=updates, goto="debate_round")
 
-        # No consensus - proceed to structured debate rounds
-        updates["round_number"] = 1
-        return Command(update=updates, goto="debate_round")
 
 
 class DebateRoundNode:
@@ -354,26 +430,23 @@ class DebateRoundNode:
 
     def __init__(self, model_info: str = "gemini-2.5-flash") -> None:
         self.model_info = model_info
-        self._agent_cache: Dict[int, LangGraphAgent] = {}
 
-    def _get_agent(self, expert: Dict[str, Any]) -> LangGraphAgent:
-        expert_id = expert.get("id")
-        if expert_id not in self._agent_cache:
-            role = expert.get("role") or expert.get("expertise", "medical specialist")
-            self._agent_cache[expert_id] = LangGraphAgent(
-                instruction=(
-                    f"You are a {role} taking part in a structured debate."
-                    " Read the other experts' arguments and, if needed, update"
-                    " your answer. Always respond with JSON and limit reasoning to"
-                    " 100 words."
-                ),
-                role=f"debater_{expert_id}",
-                model_info=self.model_info,
-            )
-        return self._agent_cache[expert_id]
+    def _build_agent(self, expert: Dict[str, Any]) -> LangGraphAgent:
+        role = expert.get("role") or expert.get("expertise", "medical specialist")
+        expert_id = expert.get("id", "unknown")
+        return LangGraphAgent(
+            instruction=(
+                f"You are a {role} taking part in a structured debate."
+                " Read the other experts' arguments and, if needed, update"
+                " your answer. Always respond with JSON and limit reasoning to"
+                " 100 words."
+            ),
+            role=f"debater_{expert_id}",
+            model_info=self.model_info,
+        )
 
     def _call_expert(self, expert: Dict[str, Any], prompt: str) -> Tuple[str, UsageDelta]:
-        agent = self._get_agent(expert)
+        agent = self._build_agent(expert)
         response = agent.chat(prompt)
         usage = agent.get_token_usage()
         agent.clear_history()
@@ -382,44 +455,15 @@ class DebateRoundNode:
             output_tokens=usage.get("output_tokens", 0),
         )
 
-    def conduct_debate_round(self, state: IntermediateProcessingState) -> Command:
-        round_number = state.get("round_number", 1)
-        experts = state.get("experts", [])
-        previous_responses_list: List[Dict[str, Any]] = state.get("expert_responses", []) or []
-        options = state.get("answer_options", [])
-        question = state["question"]
-        options_text = "\n".join(options) if options else "No answer options provided"
-
-        if round_number > self.MAX_ROUNDS:
-            return Command(goto="moderator")
-
-        # Build latest view per expert from existing list, if any
-        latest_by_id: Dict[int, Dict[str, Any]] = {}
-        for item in previous_responses_list:
-            try:
-                eid = int(item.get("expert_id"))
-            except (ValueError, TypeError):
-                continue
-            latest_by_id[eid] = item
-
-        responses_this_round: List[Dict[str, Any]] = []
-        cumulative_usage = UsageDelta()
-
-        with langsmith_span(
-            "intermediate.debate_round",
-            run_type="chain",
-            inputs={
-                "round": round_number,
-                "question_preview": preview_text(question),
-            },
-        ) as (_, finish_span):
-            for expert in experts:
-                expert_id = int(expert.get("id"))
-                # Collect latest opinions from other experts for full information sharing
-                others = [
-                    v for k, v in latest_by_id.items() if int(k) != expert_id
-                ]
-                prompt = f"""
+    @staticmethod
+    def _format_prompt(
+        expert: Dict[str, Any],
+        question: str,
+        options_text: str,
+        round_number: int,
+        others: List[Dict[str, Any]],
+    ) -> str:
+        return f"""
 You are participating in debate round {round_number} as the {expert.get('role') or expert.get('expertise', 'expert')}.
 
 Question:
@@ -434,47 +478,152 @@ Here are the most recent responses from your fellow experts (JSON list):
 Update your answer if needed. Respond ONLY with JSON {{"answer": "A/B/C/D/E", "reasoning": "..."}}.
 Limit reasoning to 100 words.
 """
-                response, usage = self._call_expert(expert, prompt)
-                cumulative_usage.input_tokens += usage.input_tokens
-                cumulative_usage.output_tokens += usage.output_tokens
-                parsed = _extract_expert_response(response)
-                latest = {
-                    "expert_id": expert_id,
-                    "role": expert.get("role") or expert.get("expertise", "expert"),
-                    "answer": parsed.get("answer", ""),
-                    "reasoning": parsed.get("reasoning", ""),
-                    "round": round_number,
+
+    def conduct_debate_round(self, state: IntermediateProcessingState) -> Command:
+        """Dispatch a debate round and fan out parallel expert updates."""
+
+        round_number = state.get("round_number", 1)
+        experts = state.get("experts", []) or []
+        previous_responses: List[Dict[str, Any]] = state.get("expert_responses", []) or []
+        options = state.get("answer_options", [])
+        question = state["question"]
+        options_text = "\n".join(options) if options else "No answer options provided"
+
+        if round_number > self.MAX_ROUNDS:
+            return Command(goto="moderator")
+
+        latest_by_id: Dict[int, Dict[str, Any]] = {}
+        for item in previous_responses:
+            try:
+                eid = int(item.get("expert_id"))
+            except (ValueError, TypeError):
+                continue
+            latest_by_id[eid] = item
+
+        if not experts:
+            return Command(goto="moderator")
+
+        with langsmith_span(
+            "intermediate.debate_round",
+            run_type="chain",
+            inputs={
+                "round": round_number,
+                "question_preview": preview_text(question),
+            },
+        ) as (_, finish_span):
+            send_targets: List[Send] = []
+            base_state = {
+                **state,
+                "processing_stage": f"debate_round_{round_number}_in_progress",
+                "_debate_round_number": round_number,
+            }
+
+            for expert in experts:
+                try:
+                    expert_id = int(expert.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                others = [
+                    v for k, v in latest_by_id.items()
+                    if int(k) != expert_id
+                ]
+                payload = {
+                    **base_state,
+                    "_debate_expert": expert,
+                    "_debate_question": question,
+                    "_debate_options_text": options_text,
+                    "_debate_others": others,
                 }
-                responses_this_round.append(latest)
-                latest_by_id[expert_id] = latest
+                send_targets.append(Send("debate_round_worker", payload))
 
-            consensus, answer = _check_consensus_from_list(list(latest_by_id.values()))
+            finish_span(outputs={"experts": len(send_targets)})
 
-            finish_span(
-                outputs={
-                    "consensus": consensus,
-                    "answer": answer,
-                    "round": round_number,
+            if not send_targets:
+                return Command(goto="moderator")
+
+            return Command(
+                update={
+                    "processing_stage": f"debate_round_{round_number}_in_progress",
                 },
-                usage=cumulative_usage.as_dict(),
+                goto=send_targets,
             )
 
-        updates: Dict[str, Any] = {
-            # Append this round's responses; parent graph merges via Annotated reducer
-            "expert_responses": responses_this_round,
-            "token_usage": cumulative_usage.as_dict(),
-            "processing_stage": f"debate_round_{round_number}_complete",
+    def process_debate_expert(self, state: IntermediateProcessingState) -> Dict[str, Any]:
+        """Run a single expert debate turn; executed in parallel via Send."""
+
+        expert = state.get("_debate_expert", {})
+        round_number = state.get("_debate_round_number", state.get("round_number", 1))
+        question = state.get("_debate_question", "")
+        options_text = state.get("_debate_options_text", "")
+        others = state.get("_debate_others", [])
+
+        prompt = self._format_prompt(expert, question, options_text, round_number, others)
+        response, usage = self._call_expert(expert, prompt)
+        parsed = _extract_expert_response(response)
+
+        expert_id = expert.get("id")
+        try:
+            normalized_id = int(expert_id)
+        except (TypeError, ValueError):
+            normalized_id = expert_id
+
+        latest = {
+            "expert_id": normalized_id,
+            "role": expert.get("role") or expert.get("expertise", "expert"),
+            "answer": parsed.get("answer", ""),
+            "reasoning": parsed.get("reasoning", ""),
+            "round": round_number,
         }
 
+        return {
+            "expert_responses": [latest],
+            "token_usage": usage.as_dict(),
+            "_debate_round_number": round_number,
+        }
+
+    def collect_debate_results(self, state: IntermediateProcessingState) -> Command:
+        """Aggregate expert responses, check consensus, and determine next step."""
+
+        current_round = state.get("_debate_round_number", state.get("round_number", 1))
+        responses = state.get("expert_responses", []) or []
+
+        latest_by_id: Dict[int, Dict[str, Any]] = {}
+        for item in responses:
+            try:
+                eid = int(item.get("expert_id"))
+            except (ValueError, TypeError):
+                continue
+            if eid not in latest_by_id or latest_by_id[eid].get("round", 0) <= item.get("round", 0):
+                latest_by_id[eid] = item
+
+        consensus, answer = _check_consensus_from_list(list(latest_by_id.values()))
+
         if consensus and answer:
-            updates["final_decision"] = {"answer": answer, "reasoning": "consensus"}
-            return Command(update=updates, goto="intermediate_complete")
+            return Command(
+                update={
+                    "final_decision": {"answer": answer, "reasoning": "consensus"},
+                    "processing_stage": "consensus_reached",
+                    "round_number": current_round,
+                },
+                goto="intermediate_complete",
+            )
 
-        if round_number >= self.MAX_ROUNDS:
-            return Command(update=updates, goto="moderator")
+        if current_round >= self.MAX_ROUNDS:
+            return Command(
+                update={
+                    "processing_stage": "debate_rounds_exhausted",
+                    "round_number": current_round,
+                },
+                goto="moderator",
+            )
 
-        updates["round_number"] = round_number + 1
-        return Command(update=updates, goto="debate_round")
+        return Command(
+            update={
+                "round_number": current_round + 1,
+                "processing_stage": f"debate_round_{current_round + 1}_pending",
+            },
+            goto="debate_round",
+        )
 
 
 class ModeratorNode:
@@ -583,24 +732,53 @@ def finalize_intermediate_processing(state: IntermediateProcessingState) -> Inte
 
 
 def create_intermediate_processing_subgraph(model_info: str = "gemini-2.5-flash") -> StateGraph:
-    """Construct the LangGraph subgraph that implements the intermediate pipeline."""
+    """Construct the LangGraph subgraph that implements the intermediate pipeline with native parallel execution."""
 
     subgraph = StateGraph(IntermediateProcessingState)
 
+    # Initialize node instances
     recruiter = ExpertRecruitmentNode(model_info=model_info)
-    initial = ExpertResponseNode(model_info=model_info)
+    dispatcher = ExpertResponseNode(model_info=model_info)
+
+    # Create individual expert nodes for parallel execution
+    expert_1 = IndividualExpertNode(model_info=model_info)
+    expert_2 = IndividualExpertNode(model_info=model_info)
+    expert_3 = IndividualExpertNode(model_info=model_info)
+
+    consensus_checker = ConsensusCheckerNode(model_info=model_info)
     debate = DebateRoundNode(model_info=model_info)
     moderator = ModeratorNode(model_info=model_info)
 
+    # Add nodes to graph
     subgraph.add_node("expert_recruitment", recruiter.recruit_experts)
-    subgraph.add_node("initial_responses", initial.provide_initial_responses)
+    subgraph.add_node("dispatch_experts", dispatcher.dispatch_to_experts)
+
+    # Parallel expert nodes - these will run concurrently in a superstep
+    subgraph.add_node("expert_1_response", expert_1.process_expert_response)
+    subgraph.add_node("expert_2_response", expert_2.process_expert_response)
+    subgraph.add_node("expert_3_response", expert_3.process_expert_response)
+
+    # Fan-in node to check consensus after parallel execution
+    subgraph.add_node("check_consensus", consensus_checker.check_consensus)
+
     subgraph.add_node("debate_round", debate.conduct_debate_round)
+    subgraph.add_node("debate_round_worker", debate.process_debate_expert)
+    subgraph.add_node("debate_round_collect", debate.collect_debate_results)
     subgraph.add_node("moderator", moderator.make_final_decision)
     subgraph.add_node("intermediate_complete", finalize_intermediate_processing)
 
-    # Use only essential static edges; nodes handle routing via Command.goto
+    # Configure edges for native LangGraph parallel execution
     subgraph.add_edge("__start__", "expert_recruitment")
-    subgraph.add_edge("expert_recruitment", "initial_responses")
-    # All other routing handled dynamically by Command.goto
+    subgraph.add_edge("expert_recruitment", "dispatch_experts")
 
+    # Fan-in: All parallel expert nodes feed into consensus checker
+    # These edges create the superstep where experts run in parallel
+    subgraph.add_edge("expert_1_response", "check_consensus")
+    subgraph.add_edge("expert_2_response", "check_consensus")
+    subgraph.add_edge("expert_3_response", "check_consensus")
+
+    # Debate round edges (unchanged - already working)
+    subgraph.add_edge("debate_round_worker", "debate_round_collect")
+
+    # All other routing handled dynamically by Command.goto
     return subgraph
